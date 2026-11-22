@@ -1,5 +1,8 @@
 name: Build
 
+permissions:
+  contents: write
+
 concurrency:
   group: "build"
   cancel-in-progress: true
@@ -39,7 +42,7 @@ jobs:
           java-version: 17
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v2
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
