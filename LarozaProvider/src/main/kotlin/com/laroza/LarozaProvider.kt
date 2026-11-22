@@ -20,6 +20,7 @@ import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 
 class LarozaProvider : MainAPI() {
@@ -118,21 +119,45 @@ class LarozaProvider : MainAPI() {
     ): Boolean {
         var found = false
 
-        // 1) Find the embed page for this video
-        val pageDoc = app.get(data).document
+        // The watch page (play.php, same vid as video.php) lists every server
         val vid = Regex("[?&]vid=([a-zA-Z0-9]+)").find(data)?.groupValues?.get(1)
-        val embedUrl = pageDoc.selectFirst("a[href*=embed.php]")?.attr("href")?.let { fixUrl(it) }
-            ?: vid?.let { "$mainUrl/embed.php?vid=$it" }
-            ?: return false
+        val playUrl = when {
+            data.contains("video.php") -> data.replace("video.php", "play.php")
+            vid != null -> "$mainUrl/play.php?vid=$vid"
+            else -> null
+        }
+        val servers = playUrl?.let { url ->
+            app.get(url, referer = data).document
+                .select("ul.WatchList li[data-embed-url]")
+                .mapNotNull { li -> li.attr("data-embed-url").trim().takeIf { it.isNotBlank() } }
+        }.orEmpty().distinct()
 
-        // 2) The embed page iframes the real player host
-        val embedHtml = app.get(embedUrl, referer = data).text
-        val playerUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
-            .find(embedHtml)?.groupValues?.get(1)?.let { fixUrl(it) }
-            ?: return false
+        for (serverUrl in servers) {
+            try {
+                if (serverUrl.contains("okhd.site")) {
+                    found = extractOkhd(fixUrl(serverUrl), playUrl ?: data, callback) || found
+                } else {
+                    found = loadExtractor(fixUrl(serverUrl), playUrl ?: data, subtitleCallback, callback) || found
+                }
+            } catch (_: Exception) {
+                // one dead server must not kill the rest
+            }
+        }
 
-        // 3) The player page hides the stream URL in packed javascript
-        val playerHtml = app.get(playerUrl, referer = embedUrl).text
+        // Fallback for pages without a server list: video page -> embed.php -> player host
+        if (!found) {
+            found = extractFromEmbedPage(data, callback)
+        }
+        return found
+    }
+
+    private suspend fun extractOkhd(
+        playerUrl: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // The player page hides the stream URL in packed javascript
+        val playerHtml = app.get(playerUrl, referer = referer).text
         val scripts = Regex("""eval\(function\(p,a,c,k,e,d\).*?</script>""", RegexOption.DOT_MATCHES_ALL)
             .findAll(playerHtml)
             .map { it.value.removeSuffix("</script>").trim() }
@@ -148,6 +173,7 @@ class LarozaProvider : MainAPI() {
             Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""").findAll(text).map { it.value }.toList()
         }.distinct()
 
+        var found = false
         for (streamUrl in streams) {
             M3u8Helper.generateM3u8(
                 this.name,
@@ -157,5 +183,23 @@ class LarozaProvider : MainAPI() {
             found = true
         }
         return found
+    }
+
+    private suspend fun extractFromEmbedPage(
+        data: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val pageDoc = app.get(data).document
+        val vid = Regex("[?&]vid=([a-zA-Z0-9]+)").find(data)?.groupValues?.get(1)
+        val embedUrl = pageDoc.selectFirst("a[href*=embed.php]")?.attr("href")?.let { fixUrl(it) }
+            ?: vid?.let { "$mainUrl/embed.php?vid=$it" }
+            ?: return false
+
+        val embedHtml = app.get(embedUrl, referer = data).text
+        val playerUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""")
+            .find(embedHtml)?.groupValues?.get(1)?.let { fixUrl(it) }
+            ?: return false
+
+        return extractOkhd(playerUrl, embedUrl, callback)
     }
 }
