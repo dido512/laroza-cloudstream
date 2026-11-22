@@ -1,0 +1,9 @@
+{
+  "manifestVersion": 1,
+  "name": "Laroza",
+  "description": "إضافات Cloudstream لموقع لاروزا: أفلام ومسلسلات عربية وأجنبية من laroza1.cfd",
+  "iconUrl": "https://github.com/dido512.png",
+  "pluginLists": [
+    "https://raw.githubusercontent.com/dido512/laroza-cloudstream/builds/plugins.json"
+  ]
+}
