@@ -16,7 +16,8 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newLiveSearchResponse
 import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 import org.jsoup.Jsoup
@@ -122,10 +123,11 @@ class Aflam4youProvider : MainAPI() {
             .ifEmpty { listOf(firstServerUrl) }
             .distinct()
 
+        val targets = mutableListOf<Triple<String, String, String>>()
         servers.forEachIndexed { index, serverUrl ->
             try {
                 val html = if (index == 0 && serverUrl == firstServerUrl) firstHtml
-                    else app.get(serverUrl, referer = data).text
+                    else app.get(serverUrl, referer = data, timeout = 8L).text
                 val embedC = Regex("""var embed_c = '([^']+)'""")
                     .find(html)?.groupValues?.get(1) ?: return@forEachIndexed
 
@@ -140,20 +142,28 @@ class Aflam4youProvider : MainAPI() {
                     ?: return@forEachIndexed
                 val serverName = "$name Server ${index + 1}"
 
+                targets.add(Triple(streamOrPlayer, serverUrl, serverName))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Keep collecting other servers even if one page fails.
+            }
+        }
+        // Resolve direct streams first. A dead external host must not exhaust
+        // the app's loading timeout before a later clear HLS server is tried.
+        for ((target, serverUrl, serverName) in targets.sortedBy { if (it.first.contains(".m3u8")) 0 else 1 }) {
+            try {
                 when {
-                    streamOrPlayer.contains(".m3u8") -> {
-                        found = emitUnencryptedHls(streamOrPlayer, serverUrl, serverName, callback) || found
+                    target.contains(".m3u8") -> {
+                        found = emitUnencryptedHls(target, serverUrl, serverName, emptyMap(), callback) || found
                     }
-                    streamOrPlayer.contains(".mpd") || streamOrPlayer.contains("/manifest") -> {
-                        // DASH sources on this site may require DRM. Do not use keys or licenses.
-                    }
+                    target.contains(".mpd") || target.contains("/manifest") -> Unit
                     else -> {
-                        // Built-in extractors handle supported hosts without custom bypass logic.
                         val candidates = mutableListOf<ExtractorLink>()
-                        loadExtractor(streamOrPlayer, serverUrl, subtitleCallback) { candidates.add(it) }
+                        loadExtractor(target, serverUrl, subtitleCallback) { candidates.add(it) }
                         for (link in candidates) {
                             if (link.isM3u8) {
-                                found = emitUnencryptedHls(link.url, link.referer, link.name, callback) || found
+                                found = emitUnencryptedHls(link.url, link.referer, link.name, link.headers, callback) || found
                             }
                         }
                     }
@@ -161,32 +171,51 @@ class Aflam4youProvider : MainAPI() {
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                // one dead server must not kill the rest
+                // Continue to other servers.
             }
         }
         return found
     }
 
-    // Emit only clear HLS media playlists. No DRM, decryption keys, or challenge bypass.
+    // Check the actual media manifest, preserving extractor request headers.
+    // Do not use DRM keys, encrypted HLS, or challenge bypasses.
     private suspend fun emitUnencryptedHls(
         streamUrl: String,
         referer: String,
         serverName: String,
+        requestHeaders: Map<String, String>,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val response = app.get(streamUrl, referer = referer)
-        val manifest = response.text.trim()
-        if (!manifest.startsWith("#EXTM3U") || manifest.contains("#EXT-X-SESSION-KEY")) return false
-        if (Regex("""#EXT-X-KEY:.*METHOD=(?!NONE)[A-Z0-9-]+""").containsMatchIn(manifest)) return false
-        val links = M3u8Helper.generateM3u8(name, streamUrl, referer = referer, name = serverName)
-        var emitted = false
-        for (link in links) {
-            val media = app.get(link.url, referer = referer).text.trim()
-            if (!media.startsWith("#EXTM3U") || media.contains("#EXT-X-SESSION-KEY")) continue
-            if (Regex("""#EXT-X-KEY:.*METHOD=(?!NONE)[A-Z0-9-]+""").containsMatchIn(media)) continue
-            callback(link)
-            emitted = true
+        val seen = mutableSetOf<String>()
+        suspend fun visit(url: String, depth: Int): Boolean {
+            if (depth > 2 || !seen.add(url)) return false
+            val response = app.get(url, referer = referer, headers = requestHeaders, timeout = 8L)
+            val text = response.text.trim().removePrefix("\uFEFF")
+            if (response.code !in 200..299 || !text.startsWith("#EXTM3U")) return false
+            if (Regex("""(?m)^#EXT-X-(?:SESSION-)?KEY:""").containsMatchIn(text)) return false
+            val lines = text.lineSequence().map { it.trim() }.toList()
+            val variants = lines.indices.filter { lines[it].startsWith("#EXT-X-STREAM-INF:") }
+                .mapNotNull { i -> lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } }
+                .take(12)
+            if (variants.isNotEmpty()) {
+                var emitted = false
+                for (variant in variants) {
+                    try {
+                        val child = java.net.URI(response.url).resolve(variant).toString()
+                        emitted = visit(child, depth + 1) || emitted
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) { }
+                }
+                return emitted
+            }
+            if (!text.contains("#EXTINF:")) return false
+            callback(newExtractorLink(name, serverName, response.url, ExtractorLinkType.M3U8) {
+                this.referer = referer
+                this.headers = requestHeaders
+            })
+            return true
         }
-        return emitted
+        return visit(streamUrl, 0)
     }
 }
