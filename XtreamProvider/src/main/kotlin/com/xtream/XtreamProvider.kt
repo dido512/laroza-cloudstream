@@ -76,6 +76,63 @@ object XtreamSession {
         return s
     }
 
+    /**
+     * Parses an Xtream-compatible link that carries API credentials into
+     * (server, username, password), or null when the input is a plain server
+     * address or a link without Xtream credentials. Supported forms:
+     *  - {base}/get.php?username=U&password=P...   (the M3U playlist link)
+     *  - {base}/player_api.php / panel_api.php / xmltv.php / enigma2.php
+     *    with the same username/password query params
+     *  - {base}/{live|movie|series}/U/P/{id}.{ext} (a stream URL)
+     * Scheme, port and any base path are preserved. Arbitrary playlist URLs
+     * without Xtream API credentials are never converted.
+     */
+    fun parseXtreamLink(raw: String): Triple<String, String, String>? {
+        val s = raw.trim()
+        if (!s.startsWith("http://") && !s.startsWith("https://")) return null
+        val uri = try { java.net.URI(s) } catch (e: Exception) { return null }
+        if (uri.host.isNullOrBlank() || uri.userInfo != null) return null
+        val segments = (uri.rawPath ?: "").split("/").filter { it.isNotBlank() }
+        if (segments.isEmpty()) return null
+
+        fun baseUrl(dropLast: Int): String {
+            val keep = segments.dropLast(dropLast)
+            val path = if (keep.isEmpty()) "" else keep.joinToString("/", prefix = "/")
+            return uri.scheme + "://" + uri.authority + path
+        }
+
+        fun decode(v: String): String = try {
+            java.net.URLDecoder.decode(v, "UTF-8")
+        } catch (e: Exception) { v }
+
+        fun queryParam(name: String): String? {
+            val q = uri.rawQuery ?: return null
+            for (pair in q.split("&")) {
+                val eq = pair.indexOf('=')
+                if (eq <= 0) continue
+                if (pair.substring(0, eq).equals(name, ignoreCase = true)) {
+                    return decode(pair.substring(eq + 1)).trim().takeIf { it.isNotBlank() }
+                }
+            }
+            return null
+        }
+
+        val last = segments.last().lowercase()
+        if (last in setOf("get.php", "player_api.php", "panel_api.php", "xmltv.php", "enigma2.php")) {
+            val u = queryParam("username") ?: return null
+            val p = queryParam("password") ?: return null
+            return Triple(baseUrl(1), u, p)
+        }
+        if (segments.size >= 4 &&
+            segments[segments.size - 4].lowercase() in setOf("live", "movie", "series")
+        ) {
+            val u = decode(segments[segments.size - 3]).trim()
+            val p = decode(segments[segments.size - 2]).trim()
+            if (u.isNotBlank() && p.isNotBlank()) return Triple(baseUrl(4), u, p)
+        }
+        return null
+    }
+
     val selected = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     fun encode(value: String): String =
