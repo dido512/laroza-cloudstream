@@ -150,7 +150,13 @@ class Yala5LiveProvider : MainAPI() {
                     if (uri.scheme !in setOf("https", "http") || uri.userInfo != null) continue
                     try {
                         if (emitted.add(stream) && unencryptedHls(stream, response.url)) {
-                            callback(newExtractorLink(name, "$name - $host ${URI(response.url).path.substringAfterLast('/').ifBlank { URI(response.url).path.trimEnd('/').substringAfterLast('/') }} ${URI(response.url).query.orEmpty()} (بث الموقع، محتوى المباراة غير مؤكد)", stream, ExtractorLinkType.M3U8) {
+                            val pageUri = URI(response.url)
+                            val serverTag = pageUri.rawQuery.orEmpty().split('&')
+                                .firstOrNull { it.startsWith("serv=") || it.startsWith("channel=") }
+                                ?.take(32).orEmpty()
+                            val label = listOf(host, pageUri.path.trimEnd('/').substringAfterLast('/').take(24), serverTag)
+                                .filter { it.isNotBlank() }.joinToString(" / ")
+                            callback(newExtractorLink(name, label, stream, ExtractorLinkType.M3U8) {
                                 this.referer = response.url
                             })
                             found = true
@@ -242,4 +248,4 @@ class Yala5LiveProvider : MainAPI() {
         }
         return inspect(url, 0)
     }
-                          }
+}
