@@ -400,7 +400,7 @@ class StalkerProvider : MainAPI() {
         }
 
         /** Bounded lookup: walks pages until [pred] matches (usually cached). */
-        suspend fun find(pred: (T) -> Boolean, maxPages: Int = LOOKUP_MAX_PAGES): T? {
+        suspend fun find(maxPages: Int = LOOKUP_MAX_PAGES, pred: (T) -> Boolean): T? {
             var p = 1
             while (p <= totalPages && p <= maxPages) {
                 val items = try {
@@ -673,7 +673,7 @@ class StalkerProvider : MainAPI() {
                                 epNums.forEach { epNode ->
                                     val epNum = epNode.asText().toIntOrNull() ?: return@forEach
                                     episodes.add(
-                                        newEpisode(dataToken("series", id, epNum.toString()), fix = false) {
+                                        newEpisode(dataToken("series", id, epNum.toString()), fix = false).apply {
                                             this.name = "الحلقة $epNum"
                                             this.season = seasonNo
                                             this.episode = epNum
@@ -737,7 +737,7 @@ class StalkerProvider : MainAPI() {
         val id = parts[2]
         val seriesEp = parts[3].ifBlank { null }
 
-        val rawCmd: String? = when (kind) {
+        val rawCmd: String = when (kind) {
             "live" -> liveSection.find { it.id == id }?.cmd
             "movie" -> vodSection.find { it.id == id }?.cmd
             "series" -> findSeries(id)?.cmd
