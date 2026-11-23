@@ -27,6 +27,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
 
 /**
@@ -74,6 +76,8 @@ object XtreamSession {
         return s
     }
 
+    val selected = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     fun encode(value: String): String =
         URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
@@ -105,100 +109,132 @@ class XtreamProvider : MainAPI() {
 
     // ---------- cached catalog ----------
 
-    // Keyed by the session generation so any credential change, including a
-    // password change for the same username, never serves stale catalog data.
-    private data class Cache<T>(val generation: Long, val at: Long, val items: List<T>)
+    // Lazy, category-first browsing: only the small category list and the
+    // streams of the category being opened are requested. The full
+    // get_live_streams / get_vod_streams / get_series lists are never fetched.
+    // Xtream has no server-side pagination or search: a category's streams
+    // arrive as one array.
+    private data class Cat(val id: String, val name: String)
+    private data class Item(val id: String, val name: String, val image: String?, val ext: String?, val year: Int?)
 
-    private data class LiveItem(val id: String, val name: String, val icon: String?)
-    private data class VodItem(
-        val id: String, val name: String, val icon: String?,
-        val ext: String?, val rating: String?
-    )
-    private data class SeriesItem(
-        val id: String, val name: String, val cover: String?,
-        val plot: String?, val rating: String?, val year: Int?
-    )
+    private val lock = Any()
+    private var stateGen = -1L
+    private val cats = HashMap<String, List<Cat>>()
+    private val streams = HashMap<String, List<Item>>()
+    private val known = HashMap<String, Item>()
+    private val pageStart = HashMap<String, Int>()
 
-    private val cacheLock = Any()
-    private var liveCache: Cache<LiveItem>? = null
-    private var vodCache: Cache<VodItem>? = null
-    private var seriesCache: Cache<SeriesItem>? = null
-
-    private suspend fun <T> cached(
-        read: () -> Cache<T>?,
-        write: (Cache<T>) -> Unit,
-        action: String,
-        parse: (JsonNode) -> List<T>
-    ): List<T> {
-        val now = System.currentTimeMillis()
-        val gen = XtreamSession.generation
-        synchronized(cacheLock) { read() }?.let {
-            if (it.generation == gen && now - it.at < CACHE_TTL_MS) return it.items
+    private fun syncGen() {
+        val g = XtreamSession.generation
+        if (g != stateGen) {
+            cats.clear(); streams.clear(); known.clear(); pageStart.clear()
+            stateGen = g
         }
-        val root = fetchJson(apiAction(action))
-        if (!root.isArray) throw ErrorLoadingException("استجابة غير متوقعة من سيرفر Xtream")
-        val items = parse(root)
-        synchronized(cacheLock) {
-            // A credential change during the fetch must not store the old account's data.
-            if (gen == XtreamSession.generation) write(Cache(gen, now, items))
-        }
-        return items
     }
 
-    private suspend fun liveItems(): List<LiveItem> =
-        cached({ liveCache }, { liveCache = it }, "get_live_streams") { root ->
-            root.mapNotNull { el ->
-                val id = el.s("stream_id") ?: return@mapNotNull null
-                LiveItem(id, el.s("name") ?: "قناة $id", el.s("stream_icon"))
-            }
-        }
+    private fun catAction(kind: String) = when (kind) {
+        "live" -> "get_live_categories"
+        "movie" -> "get_vod_categories"
+        else -> "get_series_categories"
+    }
 
-    private suspend fun vodItems(): List<VodItem> =
-        cached({ vodCache }, { vodCache = it }, "get_vod_streams") { root ->
-            root.mapNotNull { el ->
-                val id = el.s("stream_id") ?: return@mapNotNull null
-                VodItem(
-                    id,
-                    el.s("name") ?: "فيلم $id",
-                    el.s("stream_icon"),
-                    el.s("container_extension"),
-                    el.s("rating")
-                )
-            }
-        }
+    private fun streamAction(kind: String) = when (kind) {
+        "live" -> "get_live_streams"
+        "movie" -> "get_vod_streams"
+        else -> "get_series"
+    }
 
-    private suspend fun seriesItems(): List<SeriesItem> =
-        cached({ seriesCache }, { seriesCache = it }, "get_series") { root ->
-            root.mapNotNull { el ->
-                val id = el.s("series_id") ?: return@mapNotNull null
-                SeriesItem(
-                    id,
-                    el.s("name") ?: "مسلسل $id",
-                    el.s("cover"),
-                    el.s("plot"),
-                    el.s("rating"),
-                    el.s("releaseDate")?.take(4)?.toIntOrNull()
-                )
+    private suspend fun categories(kind: String): List<Cat> {
+        synchronized(lock) { syncGen(); cats[kind] }?.let { return it }
+        val gen = XtreamSession.generation
+        val root = fetchJson(apiAction(catAction(kind)))
+        if (!root.isArray) throw ErrorLoadingException("استجابة غير متوقعة من سيرفر Xtream")
+        val list = root.mapNotNull { el ->
+            val id = el.s("category_id") ?: return@mapNotNull null
+            Cat(id, el.s("category_name") ?: id)
+        }
+        synchronized(lock) { syncGen(); if (gen == stateGen) cats[kind] = list }
+        return list
+    }
+
+    private suspend fun itemsOf(kind: String, cat: Cat): List<Item> {
+        val key = kind + "|" + cat.id
+        synchronized(lock) { syncGen(); streams[key] }?.let { return it }
+        val gen = XtreamSession.generation
+        val root = fetchJson(apiAction(streamAction(kind), "&category_id=" + XtreamSession.encode(cat.id)))
+        if (!root.isArray) throw ErrorLoadingException("استجابة غير متوقعة من سيرفر Xtream")
+        val list = root.mapNotNull { el ->
+            val idField = if (kind == "series") "series_id" else "stream_id"
+            val id = el.s(idField) ?: return@mapNotNull null
+            Item(
+                id,
+                el.s("name") ?: id,
+                el.s(if (kind == "series") "cover" else "stream_icon"),
+                el.s("container_extension"),
+                el.s("releaseDate")?.take(4)?.toIntOrNull()
+            )
+        }
+        synchronized(lock) {
+            syncGen()
+            if (gen == stateGen) {
+                streams[key] = list
+                list.forEach { known[kind + "|" + it.id] = it }
             }
         }
+        return list
+    }
+
+    private fun knownItem(kind: String, id: String): Item? =
+        synchronized(lock) { syncGen(); known[kind + "|" + id] }
 
     // ---------- http + json helpers ----------
 
     private fun apiAction(action: String, extra: String = ""): String =
         "${XtreamSession.apiBase()}&action=$action$extra"
 
-    private suspend fun fetchJson(url: String): JsonNode {
+    private suspend fun fetchJson(url: String): JsonNode = kotlin.coroutines.suspendCoroutine { cont ->
+        Thread { cont.resumeWith(runCatching { fetchJsonBlocking(url) }) }.start()
+    }
+
+    private fun fetchJsonBlocking(url: String): JsonNode {
         // Never let the request URL (which carries credentials) leak into an
         // exception message shown in the app's error UI.
-        val text = try {
-            app.get(url, timeout = 120L).text
-        } catch (e: Exception) {
-            throw ErrorLoadingException("تعذر الاتصال بالسيرفر. تأكد من الرابط والشبكة")
-        }
-        val root = try {
-            mapper.readTree(text)
-        } catch (e: Exception) {
-            throw ErrorLoadingException("رد غير صالح من سيرفر Xtream")
+        // Plain JDK HTTP (the same client the working connection test uses),
+        // streamed straight into the JSON parser so very large catalogs are not
+        // copied through an intermediate String. Messages never carry the URL.
+        val root: JsonNode? = run {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 20000
+                    readTimeout = if (url.contains("&action=search&")) 15000 else 60000
+                    instanceFollowRedirects = true
+                    setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+                    setRequestProperty("Accept", "*/*")
+                    setRequestProperty("Accept-Encoding", "gzip")
+                }
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    throw ErrorLoadingException("السيرفر رد بخطأ HTTP $code")
+                }
+                var stream: java.io.InputStream = conn.inputStream
+                if ("gzip".equals(conn.contentEncoding, true)) stream = java.util.zip.GZIPInputStream(stream)
+                try {
+                    mapper.readTree(stream.buffered())
+                } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
+                    throw ErrorLoadingException("رد غير صالح من سيرفر Xtream")
+                } catch (e: java.io.IOException) {
+                    throw ErrorLoadingException("انقطع الاتصال أثناء تحميل القائمة (" + e.javaClass.simpleName + ")")
+                }
+            } catch (e: ErrorLoadingException) {
+                throw e
+            } catch (e: OutOfMemoryError) {
+                throw ErrorLoadingException("القائمة كبيرة جداً على ذاكرة الجهاز")
+            } catch (e: Exception) {
+                throw ErrorLoadingException("تعذر الاتصال بالسيرفر (" + e.javaClass.simpleName + ")")
+            } finally {
+                conn?.disconnect()
+            }
         }
         if (root == null || root.isNull) throw ErrorLoadingException("رد فارغ من سيرفر Xtream")
         if (root.isObject && root.has("user_info") &&
@@ -247,91 +283,64 @@ class XtreamProvider : MainAPI() {
 
     // ---------- main page ----------
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        requireCredentials()
-        val from = (page - 1).coerceAtLeast(0) * PAGE_SIZE
-
-        fun <T> slice(items: List<T>) = items.drop(from).take(PAGE_SIZE)
-        fun hasNext(size: Int) = size > from + PAGE_SIZE
-
-        return when (request.data) {
-            SECTION_LIVE -> {
-                val items = liveItems()
-                newHomePageResponse(
-                    request.name,
-                    slice(items).map {
-                        newLiveSearchResponse(it.name, itemUrl("live", it.id), TvType.Live) {
-                            posterUrl = it.icon
-                        }
-                    },
-                    hasNext(items.size)
-                )
-            }
-
-            SECTION_MOVIE -> {
-                val items = vodItems()
-                newHomePageResponse(
-                    request.name,
-                    slice(items).map {
-                        newMovieSearchResponse(it.name, itemUrl("movie", it.id), TvType.Movie) {
-                            posterUrl = it.icon
-                        }
-                    },
-                    hasNext(items.size)
-                )
-            }
-
-            SECTION_SERIES -> {
-                val items = seriesItems()
-                newHomePageResponse(
-                    request.name,
-                    slice(items).map {
-                        newTvSeriesSearchResponse(it.name, itemUrl("series", it.id), TvType.TvSeries) {
-                            posterUrl = it.cover
-                            year = it.year
-                        }
-                    },
-                    hasNext(items.size)
-                )
-            }
-
-            else -> throw ErrorLoadingException()
+    private fun toSearch(kind: String, it: Item): SearchResponse = when (kind) {
+        "live" -> newLiveSearchResponse(it.name, itemUrl("live", it.id), TvType.Live) { posterUrl = it.image }
+        "movie" -> newMovieSearchResponse(it.name, itemUrl("movie", it.id), TvType.Movie) { posterUrl = it.image }
+        else -> newTvSeriesSearchResponse(it.name, itemUrl("series", it.id), TvType.TvSeries) {
+            posterUrl = it.image
+            year = it.year
         }
     }
 
-    // ---------- search (local filter; Xtream has no search endpoint) ----------
+    // Each home page = the next non-empty category of the section, fetched on demand.
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        requireCredentials()
+        val kind = request.data
+        if (kind != SECTION_LIVE && kind != SECTION_MOVIE && kind != SECTION_SERIES) throw ErrorLoadingException()
+        val categoryId = XtreamSession.selected[kind]
+        if (categoryId.isNullOrBlank()) return newHomePageResponse(
+            request.name + ": اختر القسم من ترس الإضافة", emptyList<SearchResponse>(), false)
+        return try {
+            val c = categories(kind).firstOrNull { it.id == categoryId }
+                ?: return newHomePageResponse(request.name + ": اختر القسم مجدداً", emptyList<SearchResponse>(), false)
+            val items = itemsOf(kind, c)
+            val from = (page - 1).coerceAtLeast(0) * PAGE_SIZE
+            newHomePageResponse(request.name + ": " + c.name,
+                items.drop(from).take(PAGE_SIZE).map { toSearch(kind, it) }, items.size > from + PAGE_SIZE)
+        } catch (e: Exception) {
+            newHomePageResponse(request.name + ": تعذر تحميل القسم، جرّب اختبار الاتصال", emptyList<SearchResponse>(), false)
+        }
+    }
 
+    // Server search is a panel extension, not part of standard Xtream V2.
     override suspend fun search(query: String): List<SearchResponse> {
         requireCredentials()
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
-
-        val movies = vodItems()
-            .filter { it.name.contains(q, ignoreCase = true) }
-            .take(SEARCH_CAP)
-            .map {
-                newMovieSearchResponse(it.name, itemUrl("movie", it.id), TvType.Movie) {
-                    posterUrl = it.icon
-                }
+        val out = mutableListOf<SearchResponse>()
+        for (kind in listOf(SECTION_MOVIE, SECTION_SERIES, SECTION_LIVE)) {
+            val type = if (kind == SECTION_MOVIE) "movies" else kind
+            val root = try { fetchJson(apiAction("search", "&type=$type&context=" + XtreamSession.encode(q))) }
+                catch (e: Exception) { null }
+            val remote = root?.takeIf { it.isArray }?.mapNotNull { el ->
+                val id = el.s(if (kind == SECTION_SERIES) "series_id" else "stream_id") ?: return@mapNotNull null
+                val title = el.s("name") ?: return@mapNotNull null
+                if (!title.contains(q, true)) return@mapNotNull null
+                Item(id, title, el.s(if (kind == SECTION_SERIES) "cover" else "stream_icon"),
+                    el.s("container_extension"), el.s("releaseDate")?.take(4)?.toIntOrNull())
             }
-        val series = seriesItems()
-            .filter { it.name.contains(q, ignoreCase = true) }
-            .take(SEARCH_CAP)
-            .map {
-                newTvSeriesSearchResponse(it.name, itemUrl("series", it.id), TvType.TvSeries) {
-                    posterUrl = it.cover
-                    year = it.year
-                }
+            if (!remote.isNullOrEmpty()) {
+                synchronized(lock) { syncGen(); remote.forEach { known[kind + "|" + it.id] = it } }
+                out.addAll(remote.take(SEARCH_CAP).map { toSearch(kind, it) })
+            } else {
+                val local = synchronized(lock) { syncGen(); known.filterKeys { it.startsWith(kind + "|") }.values.toList() }
+                out.addAll(local.filter { it.name.contains(q, true) }.take(SEARCH_CAP).map {
+                    toSearch(kind, it.copy(name = it.name + " [بحث جزئي: الأقسام المفتوحة]"))
+                })
             }
-        val live = liveItems()
-            .filter { it.name.contains(q, ignoreCase = true) }
-            .take(SEARCH_CAP)
-            .map {
-                newLiveSearchResponse(it.name, itemUrl("live", it.id), TvType.Live) {
-                    posterUrl = it.icon
-                }
-            }
-        return movies + series + live
+        }
+        if (out.isEmpty()) throw ErrorLoadingException("لا نتائج. لو السيرفر لا يدعم البحث الشامل، البحث جزئي في الأقسام المفتوحة فقط")
+        return out
     }
 
     // ---------- load ----------
@@ -344,13 +353,13 @@ class XtreamProvider : MainAPI() {
         val id = segments.lastOrNull() ?: throw ErrorLoadingException()
         return when (segments.getOrNull(segments.size - 2)) {
             "live" -> {
-                val item = liveItems().firstOrNull { it.id == id }
+                val item = knownItem("live", id)
                 newLiveStreamLoadResponse(
                     item?.name ?: "قناة $id",
                     url,
                     dataToken("live", id, null)
                 ) {
-                    posterUrl = item?.icon
+                    posterUrl = item?.image
                 }
             }
 
@@ -361,12 +370,12 @@ class XtreamProvider : MainAPI() {
     }
 
     private suspend fun loadMovie(url: String, id: String): LoadResponse {
-        val cachedItem = vodItems().firstOrNull { it.id == id }
+        val cachedItem = knownItem("movie", id)
         var ext = cachedItem?.ext
-        var poster = cachedItem?.icon
+        var poster = cachedItem?.image
         var plot: String? = null
         var year: Int? = null
-        var score: Score? = Score.from10(cachedItem?.rating)
+        var score: Score? = null
         var duration: Int? = null
         var movieName = cachedItem?.name
 
@@ -431,12 +440,12 @@ class XtreamProvider : MainAPI() {
         }
 
         val seriesName = details.s("name")
-            ?: seriesItems().firstOrNull { it.id == id }?.name
+            ?: knownItem("series", id)?.name
             ?: "مسلسل $id"
 
         return newTvSeriesLoadResponse(seriesName, url, TvType.TvSeries, episodes) {
             this.posterUrl = details.s("cover")
-                ?: seriesItems().firstOrNull { it.id == id }?.cover
+                ?: knownItem("series", id)?.image
             this.plot = details.s("plot")
             this.year = details.s("releaseDate")?.take(4)?.toIntOrNull()
             this.score = Score.from10(details.s("rating"))
@@ -487,6 +496,7 @@ class XtreamProvider : MainAPI() {
         private const val SECTION_SERIES = "series"
         private const val PAGE_SIZE = 40
         private const val SEARCH_CAP = 60
+        private const val SEARCH_MAX_CATEGORIES = 25
         private const val CACHE_TTL_MS = 15 * 60 * 1000L
     }
 }
