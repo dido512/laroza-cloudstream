@@ -7,10 +7,11 @@ import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import kotlinx.coroutines.runBlocking
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import org.json.JSONObject
 
 @CloudstreamPlugin
@@ -99,16 +100,17 @@ class StalkerPlugin : Plugin() {
                 } else {
                     Toast.makeText(ctx, "جاري اختبار الاتصال...", Toast.LENGTH_SHORT).show()
                     Thread {
-                        val result = runBlocking { testConnection(portal, mac) }
+                        val result = testConnection(portal, mac)
                         (ctx as? android.app.Activity)?.runOnUiThread {
                             Toast.makeText(ctx, result, Toast.LENGTH_LONG).show()
                             if (result.startsWith("الاتصال ناجح")) {
                                 prefs.edit()
                                     .putString(KEY_PORTAL, portal)
                                     .putString(KEY_MAC, mac)
-                                    .putString(KEY_ENDPOINT, StalkerSession.endpoint)
-                                    .putBoolean(KEY_FULL_PORTAL, StalkerSession.fullPortal)
+                                    .remove(KEY_ENDPOINT)
+                                    .remove(KEY_FULL_PORTAL)
                                     .apply()
+                                StalkerSession.update(portal, mac)
                             }
                         }
                     }.start()
@@ -125,32 +127,69 @@ class StalkerPlugin : Plugin() {
         ).apply { topMargin = 16 }
 
     /**
-     * Resolves the portal endpoint, then tries a full handshake + get_profile.
-     * Reports only account status/expiry-style fields; never echoes the MAC,
-     * token, or request URLs into the message.
+     * Probes the portal over plain JDK HTTP (the plugin compile classpath has
+     * no coroutines). Never echoes the MAC, token, or URLs into the message.
      */
-    private suspend fun testConnection(portal: String, mac: String): String {
-        StalkerSession.update(portal, mac)
-        val ok = StalkerSession.ensureEndpoint()
-        if (!ok) return "تعذر الوصول للبوابة. تأكد من الرابط وأن البوابة شغالة."
-        return try {
-            val profile = StalkerSession.request("stb", "get_profile", mapOf("hd" to "1"))
-            val js = profile.path("js")
-            when {
-                js.isMissingNode || js.isNull ->
-                    "البوابة ردت لكن بدون بيانات حساب. تأكد أنها بوابة Stalker/Ministra."
-                js.path("status").asInt(1) == 0 || js.path("blocked").asInt(0) == 1 ->
-                    "الحساب محظور أو غير فعّال في البوابة."
-                else -> {
-                    val mode = if (StalkerSession.fullPortal) "بوابة كاملة" else "لوحة مبسطة"
-                    "الاتصال ناجح ($mode)."
-                }
-            }
-        } catch (e: StalkerSession.AuthException) {
-            "البوابة رفضت الجهاز. تأكد أن عنوان MAC مسجل ومفعّل في اشتراكك."
-        } catch (e: Exception) {
-            "فشل الاتصال بالبوابة. تأكد من الرابط والشبكة."
+    private fun httpGet(url: String, mac: String): Pair<Int, String> {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15000
+            readTimeout = 30000
+            setRequestProperty(
+                "User-Agent",
+                "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 " +
+                    "(KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 234 Safari/533.3"
+            )
+            setRequestProperty("X-User-Agent", "Model: MAG250; Link: WiFi")
+            setRequestProperty(
+                "Cookie",
+                "mac=" + URLEncoder.encode(mac, "UTF-8") + "; stb_lang=en"
+            )
         }
+        return try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            code to (stream?.bufferedReader()?.readText() ?: "")
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun testConnection(portal: String, mac: String): String {
+        val rejected = "البوابة رفضت الجهاز. تأكد أن عنوان MAC مسجل ومفعّل في اشتراكك."
+        val base = portal.trim().trimEnd('/')
+        val candidates = if (base.substringAfterLast('/').endsWith(".php")) {
+            listOf(base)
+        } else {
+            listOf("$base/portal.php", "$base/server/load.php", "$base/stalker_portal/server/load.php")
+        }
+        for (candidate in candidates) {
+            val hs = try {
+                httpGet("$candidate?type=stb&action=handshake&token=&JsHttpRequest=1-xml", mac)
+            } catch (e: Exception) {
+                continue
+            }
+            if (hs.first == 401 || hs.first == 403) return rejected
+            if (hs.first !in 200..299) continue
+            val body = hs.second.trim()
+            if (body.contains("\"token\"") && !body.contains("\"token\":\"\"")) {
+                return "الاتصال ناجح (بوابة كاملة)."
+            }
+            if (body == "Authorization failed." || body == "Access denied." ||
+                body == "Unauthorized request."
+            ) {
+                return rejected
+            }
+            val probe = try {
+                httpGet("$candidate?type=itv&action=get_genres&JsHttpRequest=1-xml", mac)
+            } catch (e: Exception) {
+                continue
+            }
+            if (probe.first == 401 || probe.first == 403) return rejected
+            if (probe.first in 200..299 && probe.second.trimStart().startsWith("{\"js\":[")) {
+                return "الاتصال ناجح (لوحة مبسطة)."
+            }
+        }
+        return "تعذر الوصول للبوابة. تأكد من الرابط وأن البوابة شغالة."
     }
 
     companion object {
