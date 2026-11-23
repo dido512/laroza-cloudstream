@@ -7,9 +7,7 @@ import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
-import android.widget.Button
 import android.widget.TextView
-import org.json.JSONArray
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import org.json.JSONObject
@@ -29,9 +27,6 @@ class XtreamPlugin : Plugin() {
             prefs.getString(KEY_USER, "") ?: "",
             prefs.getString(KEY_PASS, "") ?: ""
         )
-        for (kind in listOf("live", "movie", "series")) {
-            XtreamSession.selected[kind] = prefs.getString("cat_" + kind, "") ?: ""
-        }
         registerMainAPI(XtreamProvider())
 
         // Adds the gear icon next to the provider in Settings > Extensions.
@@ -69,41 +64,8 @@ class XtreamPlugin : Plugin() {
         }
 
         layout.addView(TextView(ctx).apply {
-            text = "اختر الأقسام هنا. الصفحة تحمل القسم المختار فقط. البحث الشامل حسب دعم السيرفر، وإلا فهو جزئي في الأقسام المفتوحة فقط. احفظ بيانات الدخول أولاً قبل اختيار الأقسام."
+            text = "الصفحة الرئيسية تعرض كل أقسام السيرفر مجمعة: قنوات وأفلام ومسلسلات. محتوى القسم يتحمّل عند فتحه فقط، من غير سحب قوائم الاشتراك كلها مقدمًا. البحث الشامل يعمل حسب دعم السيرفر، وإلا فهو جزئي في الأقسام المفتوحة."
         }, rowLp())
-        for ((kind, label) in listOf("live" to "القنوات", "movie" to "الأفلام", "series" to "المسلسلات")) {
-            layout.addView(Button(ctx).apply {
-                text = "اختيار قسم " + label
-                setOnClickListener {
-                    if (!XtreamSession.hasCredentials) {
-                        Toast.makeText(ctx, "احفظ بيانات الدخول أولاً", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(ctx, "جاري جلب أسماء الأقسام فقط", Toast.LENGTH_SHORT).show()
-                        Thread {
-                            val result = runCatching {
-                                val action = when (kind) { "live" -> "get_live_categories"; "movie" -> "get_vod_categories"; else -> "get_series_categories" }
-                                val conn = URL(XtreamSession.apiBase() + "&action=" + action).openConnection() as HttpURLConnection
-                                conn.connectTimeout = 15000; conn.readTimeout = 30000
-                                val body = try { conn.inputStream.bufferedReader().use { it.readText() } } finally { conn.disconnect() }
-                                val json = JSONArray(body)
-                                (0 until json.length()).map { json.getJSONObject(it) }
-                            }
-                            (ctx as? android.app.Activity)?.runOnUiThread {
-                                val rows = result.getOrNull()
-                                if (rows == null) Toast.makeText(ctx, "تعذر جلب الأقسام. راجع اختبار الاتصال", Toast.LENGTH_LONG).show()
-                                else AlertDialog.Builder(ctx).setTitle("قسم " + label)
-                                    .setItems((listOf("بدون قسم") + rows.map { it.optString("category_name") }).toTypedArray()) { _, index ->
-                                        val id = if (index == 0) "" else rows[index - 1].optString("category_id")
-                                        prefs.edit().putString("cat_" + kind, id).apply()
-                                        XtreamSession.selected[kind] = id
-                                        Toast.makeText(ctx, "تم اختيار القسم. حدّث صفحة الإضافة", Toast.LENGTH_LONG).show()
-                                    }.show()
-                            }
-                        }.start()
-                    }
-                }
-            }, rowLp())
-        }
 
         fun readInputs(): Triple<String, String, String> = Triple(
             XtreamSession.normalizeServer(serverInput.text.toString()),
@@ -124,10 +86,6 @@ class XtreamPlugin : Plugin() {
                 if (server.isBlank() || user.isBlank() || pass.isBlank()) {
                     Toast.makeText(ctx, "أكمل البيانات الثلاثة أولاً", Toast.LENGTH_LONG).show()
                 } else {
-                    if (server != XtreamSession.server || user != XtreamSession.username || pass != XtreamSession.password) {
-                        XtreamSession.selected.clear()
-                        prefs.edit().remove("cat_live").remove("cat_movie").remove("cat_series").apply()
-                    }
                     prefs.edit()
                         .putString(KEY_SERVER, server)
                         .putString(KEY_USER, user)
