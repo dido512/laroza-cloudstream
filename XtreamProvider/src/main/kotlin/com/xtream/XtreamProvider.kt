@@ -30,9 +30,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 
 /**
  * Runtime session state for the Xtream account.
@@ -79,6 +76,8 @@ object XtreamSession {
         return s
     }
 
+    val selected = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     fun encode(value: String): String =
         URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
@@ -110,13 +109,11 @@ class XtreamProvider : MainAPI() {
 
     // ---------- cached catalog ----------
 
-    // Lazy, category-first browsing: the homepage only requests the small
-    // category-name lists (get_*_categories) and shows every category as its
-    // own card under its type row. A category's streams are requested only
-    // when that category card is opened. The full get_live_streams /
-    // get_vod_streams / get_series lists are never fetched at once.
-    // Xtream has no server-side pagination: a category's streams arrive as
-    // one array when (and only when) the category is opened.
+    // Lazy, category-first browsing: only the small category list and the
+    // streams of the category being opened are requested. The full
+    // get_live_streams / get_vod_streams / get_series lists are never fetched.
+    // Xtream has no server-side pagination or search: a category's streams
+    // arrive as one array.
     private data class Cat(val id: String, val name: String)
     private data class Item(val id: String, val name: String, val image: String?, val ext: String?, val year: Int?)
 
@@ -125,12 +122,12 @@ class XtreamProvider : MainAPI() {
     private val cats = HashMap<String, List<Cat>>()
     private val streams = HashMap<String, List<Item>>()
     private val known = HashMap<String, Item>()
-    private val catPages = HashMap<String, List<Episode>>()
+    private val pageStart = HashMap<String, Int>()
 
     private fun syncGen() {
         val g = XtreamSession.generation
         if (g != stateGen) {
-            cats.clear(); streams.clear(); known.clear(); catPages.clear()
+            cats.clear(); streams.clear(); known.clear(); pageStart.clear()
             stateGen = g
         }
     }
@@ -271,10 +268,6 @@ class XtreamProvider : MainAPI() {
     private fun itemUrl(kind: String, id: String): String =
         "${XtreamSession.server}/$kind/$id"
 
-    /** Category card url: {server}/cat/{kind}/{categoryId} */
-    private fun catUrl(kind: String, id: String): String =
-        "${XtreamSession.server}/cat/$kind/$id"
-
     /** Internal token passed as dataUrl/episode data: no credentials inside. */
     private fun dataToken(kind: String, id: String, ext: String?): String =
         "xtream|$kind|$id|${ext ?: ""}"
@@ -299,28 +292,23 @@ class XtreamProvider : MainAPI() {
         }
     }
 
-    /** A category shown as a homepage card. Only its name is loaded. */
-    private fun toCatCard(kind: String, c: Cat): SearchResponse = when (kind) {
-        "live" -> newLiveSearchResponse(c.name, catUrl("live", c.id), TvType.Live)
-        "movie" -> newMovieSearchResponse(c.name, catUrl("movie", c.id), TvType.Movie)
-        else -> newTvSeriesSearchResponse(c.name, catUrl("series", c.id), TvType.TvSeries)
-    }
-
-    // Each home row lists that type's categories as cards: every category is
-    // visible, grouped under its type, and no stream list is fetched here.
+    // Each home page = the next non-empty category of the section, fetched on demand.
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         requireCredentials()
         val kind = request.data
         if (kind != SECTION_LIVE && kind != SECTION_MOVIE && kind != SECTION_SERIES) throw ErrorLoadingException()
+        val categoryId = XtreamSession.selected[kind]
+        if (categoryId.isNullOrBlank()) return newHomePageResponse(
+            request.name + ": اختر القسم من ترس الإضافة", emptyList<SearchResponse>(), false)
         return try {
-            val cards = categories(kind).map { toCatCard(kind, it) }
-            newHomePageResponse(request.name, cards, false)
+            val c = categories(kind).firstOrNull { it.id == categoryId }
+                ?: return newHomePageResponse(request.name + ": اختر القسم مجدداً", emptyList<SearchResponse>(), false)
+            val items = itemsOf(kind, c)
+            val from = (page - 1).coerceAtLeast(0) * PAGE_SIZE
+            newHomePageResponse(request.name + ": " + c.name,
+                items.drop(from).take(PAGE_SIZE).map { toSearch(kind, it) }, items.size > from + PAGE_SIZE)
         } catch (e: Exception) {
-            newHomePageResponse(
-                request.name + ": تعذر جلب الأقسام، جرّب اختبار الاتصال من الترس",
-                emptyList<SearchResponse>(),
-                false
-            )
+            newHomePageResponse(request.name + ": تعذر تحميل القسم، جرّب اختبار الاتصال", emptyList<SearchResponse>(), false)
         }
     }
 
@@ -359,13 +347,11 @@ class XtreamProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         requireCredentials()
-        // urls are {server}/cat/{kind}/{id} for category pages and
-        // {server}/{kind}/{id} for single items; parse the trailing segments
-        // so a subpath in the server URL or a changed server host works.
+        // item urls are {server}/{kind}/{id}; parse the last two segments so a
+        // subpath in the server URL or a changed server host does not break them.
         val segments = url.substringAfter("://").split("/").filter { it.isNotBlank() }
         val id = segments.lastOrNull() ?: throw ErrorLoadingException()
         return when (segments.getOrNull(segments.size - 2)) {
-            "cat" -> loadCategory(url, segments.getOrNull(segments.size - 2 - 1) ?: throw ErrorLoadingException(), id)
             "live" -> {
                 val item = knownItem("live", id)
                 newLiveStreamLoadResponse(
@@ -381,93 +367,6 @@ class XtreamProvider : MainAPI() {
             "series" -> loadSeries(url, id)
             else -> throw ErrorLoadingException()
         }
-    }
-
-    /**
-     * A category page lists the category's own entries, fetched only now.
-     * Live and movie entries play directly. A series category flattens its
-     * series into one episode list (each episode named with its series),
-     * because the app cannot nest a series list under an opened category.
-     */
-    private suspend fun loadCategory(url: String, kind: String, catId: String): LoadResponse {
-        if (kind != SECTION_LIVE && kind != SECTION_MOVIE && kind != SECTION_SERIES) throw ErrorLoadingException()
-        val cat = categories(kind).firstOrNull { it.id == catId }
-            ?: throw ErrorLoadingException("القسم غير موجود على السيرفر")
-        val cacheKey = kind + "|" + cat.id
-        synchronized(lock) { syncGen(); catPages[cacheKey] }?.let { eps ->
-            return newTvSeriesLoadResponse(cat.name, url, TvType.TvSeries, eps) {
-                this.comingSoon = eps.isEmpty()
-            }
-        }
-
-        val items = itemsOf(kind, cat)
-        val episodes: List<Episode> = when (kind) {
-            "live", "movie" -> items.map { it ->
-                newEpisode(dataToken(kind, it.id, it.ext), fix = false).apply {
-                    this.name = it.name
-                    this.posterUrl = it.image
-                }
-            }
-
-            else -> flattenSeriesCategory(items)
-        }
-
-        synchronized(lock) {
-            syncGen()
-            if (stateGen == XtreamSession.generation) catPages[cacheKey] = episodes
-        }
-
-        return newTvSeriesLoadResponse(cat.name, url, TvType.TvSeries, episodes) {
-            this.comingSoon = episodes.isEmpty()
-            this.plot = if (kind == SECTION_SERIES && items.size > SERIES_FLATTEN_MAX)
-                "يعرض أول $SERIES_FLATTEN_MAX مسلسل من القسم. استخدم البحث للوصول لمسلسل آخر."
-            else null
-        }
-    }
-
-    /** Fetches each series' episode list (bounded concurrency) and flattens it. */
-    private suspend fun flattenSeriesCategory(series: List<Item>): List<Episode> = coroutineScope {
-        val capped = series.take(SERIES_FLATTEN_MAX)
-        val out = ArrayList<Episode>()
-        for (chunk in capped.chunked(FLATTEN_CONCURRENCY)) {
-            val parts = chunk.map { s ->
-                async {
-                    runCatching { seriesEpisodes(s) }.getOrElse { emptyList() }
-                }
-            }
-            parts.awaitAll().forEach { out.addAll(it) }
-        }
-        out
-    }
-
-    private suspend fun seriesEpisodes(s: Item): List<Episode> {
-        val root = fetchJson(apiAction("get_series_info", "&series_id=" + XtreamSession.encode(s.id)))
-        val episodesNode = root.get("episodes") ?: return emptyList()
-        if (!episodesNode.isObject) return emptyList()
-        val seasons = episodesNode.fields().asSequence().toList()
-            .sortedBy { it.key.toIntOrNull() ?: Int.MAX_VALUE }
-        val eps = ArrayList<Episode>()
-        for ((seasonKey, node) in seasons) {
-            if (!node.isArray) continue
-            for (ep in node) {
-                val epId = ep.s("id") ?: continue
-                val epInfo = ep.get("info")
-                val epTitle = ep.s("title")
-                val epNum = ep.s("episode_num")?.toIntOrNull()
-                eps.add(
-                    newEpisode(dataToken("series", epId, ep.s("container_extension")), fix = false).apply {
-                        this.name = s.name + ": " + (epTitle ?: (epNum?.let { "الحلقة $it" } ?: epId))
-                        this.episode = epNum
-                        this.posterUrl = epInfo.s("movie_image") ?: s.image
-                        this.description = epInfo.s("plot")
-                        this.score = Score.from10(epInfo.s("rating"))
-                        this.runTime = epInfo.s("duration_secs")?.toIntOrNull()?.div(60)
-                        addDate(epInfo.s("releasedate"))
-                    }
-                )
-            }
-        }
-        return eps
     }
 
     private suspend fun loadMovie(url: String, id: String): LoadResponse {
@@ -595,8 +494,9 @@ class XtreamProvider : MainAPI() {
         private const val SECTION_LIVE = "live"
         private const val SECTION_MOVIE = "movie"
         private const val SECTION_SERIES = "series"
+        private const val PAGE_SIZE = 40
         private const val SEARCH_CAP = 60
-        private const val SERIES_FLATTEN_MAX = 120
-        private const val FLATTEN_CONCURRENCY = 8
+        private const val SEARCH_MAX_CATEGORIES = 25
+        private const val CACHE_TTL_MS = 15 * 60 * 1000L
     }
 }
