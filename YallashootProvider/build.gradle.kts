@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 1
+version = 2
 
 cloudstream {
     description = "مباريات اليوم بث مباشر من يلا شوت فيديو"
