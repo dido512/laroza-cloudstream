@@ -242,7 +242,8 @@ object StalkerSession {
         type: String,
         action: String,
         extra: Map<String, String> = emptyMap(),
-        retried: Boolean = false
+        retried: Boolean = false,
+        timeoutSeconds: Long = 120L
     ): JsonNode {
         if (!hasCredentials) throw ErrorLoadingException(
             "أضف رابط البوابة وعنوان MAC من إعدادات الإضافة " +
@@ -259,7 +260,7 @@ object StalkerSession {
                 ).also { it.putAll(extra) },
                 headers = headers(),
                 cookies = cookies(),
-                timeout = 120L
+                timeout = timeoutSeconds
             )
         } catch (e: Exception) {
             throw ErrorLoadingException("تعذر الاتصال بالبوابة. تأكد من الرابط والشبكة")
@@ -285,7 +286,7 @@ object StalkerSession {
                     }.getOrNull()
                     if (!tok.isNullOrBlank()) {
                         token = tok
-                        return request(type, action, extra, retried = true)
+                        return request(type, action, extra, retried = true, timeoutSeconds = timeoutSeconds)
                     }
                 } catch (_: Exception) {
                 }
@@ -338,6 +339,7 @@ class StalkerProvider : MainAPI() {
         val mapItem: (JsonNode) -> T?
     ) {
         private val pages = mutableMapOf<Int, List<T>>()
+        private val searched = mutableListOf<T>()
         private var totalPages: Int = Int.MAX_VALUE
         private var key: String = ""
         private var fetchedAt: Long = 0L
@@ -354,6 +356,7 @@ class StalkerProvider : MainAPI() {
         suspend fun page(p: Int): List<T> {
             if (expired()) {
                 pages.clear()
+                searched.clear()
                 totalPages = Int.MAX_VALUE
                 truncated = false
                 key = currentKey()
@@ -388,6 +391,8 @@ class StalkerProvider : MainAPI() {
             while (p <= totalPages && p <= maxPages && out.size < cap) {
                 val items = try {
                     page(p)
+                } catch (e: StalkerSession.AuthException) {
+                    throw e
                 } catch (e: Exception) {
                     break
                 }
@@ -399,12 +404,52 @@ class StalkerProvider : MainAPI() {
             return out
         }
 
+        /** Search on the portal first. A missing or ignored search parameter
+         * falls back to a short local scan, never an exhaustive catalog fetch. */
+        suspend fun serverSearch(q: String, maxPages: Int, cap: Int, matches: (T) -> Boolean): List<T>? {
+            if (expired()) {
+                pages.clear(); searched.clear(); totalPages = Int.MAX_VALUE
+                key = currentKey(); fetchedAt = System.currentTimeMillis()
+            }
+            val out = mutableListOf<T>()
+            var p = 1
+            var total = Int.MAX_VALUE
+            while (p <= total && p <= maxPages && out.size < cap) {
+                val js = try {
+                    StalkerSession.request(
+                        type, "get_ordered_list", extra + mapOf("search" to q, "p" to p.toString()), timeoutSeconds = 20L
+                    ).path("js")
+                } catch (e: StalkerSession.AuthException) {
+                    throw e
+                } catch (e: Exception) {
+                    return if (p == 1) null else out
+                }
+                val data = js.path("data")
+                val items = if (data.isArray) data.mapNotNull(mapItem) else emptyList()
+                if (p == 1) {
+                    if (items.isEmpty()) return null
+                    // Ignore unfiltered replies, not unrelated catalog entries.
+                    if (items.none(matches)) return null
+                }
+                out.addAll(items.filter(matches))
+                searched.addAll(items.filter(matches))
+                val tp = js.path("total_pages")
+                total = if (tp.isNumber || tp.isTextual && tp.asText().toIntOrNull() != null) tp.asInt() else if (items.isEmpty()) 0 else Int.MAX_VALUE
+                if (items.isEmpty()) break
+                p++
+            }
+            return out.take(cap)
+        }
+
         /** Bounded lookup: walks pages until [pred] matches (usually cached). */
         suspend fun find(maxPages: Int = LOOKUP_MAX_PAGES, pred: (T) -> Boolean): T? {
+            if (!expired()) searched.firstOrNull(pred)?.let { return it }
             var p = 1
             while (p <= totalPages && p <= maxPages) {
                 val items = try {
                     page(p)
+                } catch (e: StalkerSession.AuthException) {
+                    throw e
                 } catch (e: Exception) {
                     break
                 }
@@ -478,10 +523,10 @@ class StalkerProvider : MainAPI() {
         private const val SECTION_SERIES = "series"
         private const val SEARCH_CAP = 60
         private const val CACHE_TTL_MS = 15 * 60 * 1000L
-        // Search scans at most ~25 portal pages per section; deeper matches are
+        // Fallback search scans at most 2 portal pages per section; deeper matches are
         // not returned (partial search, disclosed). Lookups walk further but
         // normally hit an already-cached page.
-        private const val SEARCH_MAX_PAGES = 25
+        private const val SEARCH_MAX_PAGES = 2
         private const val LOOKUP_MAX_PAGES = 100
 
         @Volatile
@@ -581,36 +626,49 @@ class StalkerProvider : MainAPI() {
     private fun dataToken(kind: String, id: String, seriesEp: String? = null): String =
         "stalker|$kind|$id|${seriesEp ?: ""}"
 
-    // ---------- search (local filter over a bounded scan) ----------
+    // ---------- search (portal-side search, local bounded scan fallback) ----------
 
     override suspend fun search(query: String): List<SearchResponse> {
         requireCredentials()
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
 
-        val movies = vodSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+        if (!StalkerSession.ensureEndpoint()) throw ErrorLoadingException("تعذر الوصول للبوابة")
+        val maxServerPages = 5
+        val movieRows = vodSection.serverSearch(q, maxServerPages, SEARCH_CAP) {
             !it.isSeries && it.name.contains(q, true)
-        }.map {
+        }?.filter { !it.isSeries } ?: vodSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+            !it.isSeries && it.name.contains(q, true)
+        }
+        val movies = movieRows.map {
             newMovieSearchResponse(it.name, itemUrl("movie", it.id), TvType.Movie, fix = false) {
                 posterUrl = it.poster
                 year = it.year
             }
         }
-        val series = seriesSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+        val seriesRows = seriesSection.serverSearch(q, maxServerPages, SEARCH_CAP) {
+            it.name.contains(q, true)
+        } ?: seriesSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
             it.name.contains(q, true)
         }.ifEmpty {
-            vodSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+            (vodSection.serverSearch(q, maxServerPages, SEARCH_CAP) {
+                it.isSeries && it.name.contains(q, true)
+            }?.filter { it.isSeries }) ?: vodSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
                 it.isSeries && it.name.contains(q, true)
             }
-        }.map {
+        }
+        val series = seriesRows.map {
             newTvSeriesSearchResponse(it.name, itemUrl("series", it.id), TvType.TvSeries, fix = false) {
                 posterUrl = it.poster
                 year = it.year
             }
         }
-        val live = liveSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+        val liveRows = liveSection.serverSearch(q, maxServerPages, SEARCH_CAP) {
             it.name.contains(q, true)
-        }.map {
+        } ?: liveSection.scanFilter(SEARCH_MAX_PAGES, SEARCH_CAP) {
+            it.name.contains(q, true)
+        }
+        val live = liveRows.map {
             newLiveSearchResponse(it.name, itemUrl("live", it.id), TvType.Live, fix = false) {
                 posterUrl = it.logo?.let { l -> absPoster(l) }
             }
