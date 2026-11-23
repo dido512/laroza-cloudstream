@@ -415,7 +415,7 @@ class XtreamProvider : MainAPI() {
                     val epId = ep.s("id") ?: continue
                     val epInfo = ep.get("info")
                     episodes.add(
-                        newEpisode(dataToken("series", epId, ep.s("container_extension")), fix = false) {
+                        newEpisode(dataToken("series", epId, ep.s("container_extension")), fix = false).apply {
                             this.name = ep.s("title")
                             this.season = seasonNo ?: ep.s("season")?.toIntOrNull()
                             this.episode = ep.s("episode_num")?.toIntOrNull()
