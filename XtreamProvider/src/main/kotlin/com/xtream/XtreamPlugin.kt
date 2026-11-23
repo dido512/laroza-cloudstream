@@ -7,11 +7,11 @@ import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -102,7 +102,7 @@ class XtreamPlugin : Plugin() {
                 } else {
                     Toast.makeText(ctx, "جاري اختبار الاتصال...", Toast.LENGTH_SHORT).show()
                     Thread {
-                        val result = runBlocking { testConnection(server, user, pass) }
+                        val result = testConnection(server, user, pass)
                         (ctx as? android.app.Activity)?.runOnUiThread {
                             Toast.makeText(ctx, result, Toast.LENGTH_LONG).show()
                         }
@@ -120,11 +120,20 @@ class XtreamPlugin : Plugin() {
         ).apply { topMargin = 16 }
 
     /** Calls player_api.php without an action: returns account status/expiry as a user message. */
-    private suspend fun testConnection(server: String, user: String, pass: String): String {
+    private fun testConnection(server: String, user: String, pass: String): String {
         return try {
             val url = "$server/player_api.php?username=" +
                 XtreamSession.encode(user) + "&password=" + XtreamSession.encode(pass)
-            val json = JSONObject(app.get(url, timeout = 30L).text)
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 15000
+                readTimeout = 30000
+            }
+            val body = try {
+                conn.inputStream.bufferedReader().readText()
+            } finally {
+                conn.disconnect()
+            }
+            val json = JSONObject(body)
             val info = json.optJSONObject("user_info")
                 ?: return "السيرفر رد لكن بدون بيانات حساب. تأكد أنه سيرفر Xtream Codes."
             when {
