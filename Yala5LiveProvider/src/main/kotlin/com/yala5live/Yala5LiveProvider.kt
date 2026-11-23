@@ -33,10 +33,26 @@ class Yala5LiveProvider : MainAPI() {
             uri.userInfo == null && (uri.port == -1 || uri.port in setOf(80, 443))
     }.getOrDefault(false)
 
+    private fun hostOf(url: String): String? = runCatching { URI(url).host }.getOrNull()
+
+    private fun isBlogPage(url: String): Boolean = hostOf(url) == blogHost && allowedPage(url)
+
+    /** The site sometimes publishes a short link instead of a direct page. */
+    private fun isShortLink(url: String): Boolean = runCatching {
+        val uri = URI(url)
+        uri.scheme == "https" && uri.host == "t.co" && uri.userInfo == null
+    }.getOrDefault(false)
+
     private fun Element.card(): SearchResponse? {
-        val link = selectFirst("a.alba-device-match-link[href]") ?: return null
-        val target = link.absUrl("href").ifBlank { link.attr("href") }
-        if (!allowedPage(target) || runCatching { URI(target).host }.getOrNull() != blogHost) return null
+        // The plain href now points at the site's own SEO article page; the
+        // actual player link lives in per-device data attributes that the
+        // site's script copies into href inside a browser. Read them directly.
+        val link = selectFirst("a.alba-device-match-link") ?: return null
+        val mobile = link.absUrl("data-mobile-url").ifBlank { link.attr("data-mobile-url") }.trim()
+        val desktop = link.absUrl("data-desktop-url").ifBlank { link.attr("data-desktop-url") }.trim()
+        val target = listOf(mobile, desktop).firstOrNull { isBlogPage(it) }
+            ?: listOf(mobile, desktop).firstOrNull { isShortLink(it) }
+            ?: return null
         val teams = select(".team-name").map { it.text().trim() }
         val title = teams.joinToString(" × ").ifBlank { link.attr("title").trim() }
         if (title.isBlank()) return null
@@ -71,7 +87,7 @@ class Yala5LiveProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val player = url.substringBefore('#')
-        if (!allowedPage(player)) return null
+        if (!allowedPage(player) && !isShortLink(player)) return null
         val metadata = url.substringAfter("#yala5=", "").split('&')
         if (metadata.size != 3) return null
         val values = runCatching { metadata.map { decode(it) } }.getOrNull() ?: return null
@@ -92,7 +108,7 @@ class Yala5LiveProvider : MainAPI() {
         val visited = mutableSetOf<String>()
         val emitted = mutableSetOf<String>()
         suspend fun resolve(url: String, referer: String, depth: Int): Boolean {
-            if (depth > 7 || visited.size >= 48 || !allowedPage(url) || !visited.add(url)) return false
+            if (depth > 7 || visited.size >= 48 || !(allowedPage(url) || isShortLink(url)) || !visited.add(url)) return false
             try {
                 val response = app.get(url, referer = referer, timeout = 10L)
                 if (response.code !in 200..299 || !allowedPage(response.url)) return false
