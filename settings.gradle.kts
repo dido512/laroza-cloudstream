@@ -2,3 +2,5 @@ rootProject.name = "CloudstreamPlugins"
 
 include("LarozaProvider")
 include("YallashootProvider")
+include("XtreamProvider")
+include("StalkerProvider")
