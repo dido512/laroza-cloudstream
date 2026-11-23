@@ -10,6 +10,7 @@ import android.widget.Toast
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -101,7 +102,7 @@ class XtreamPlugin : Plugin() {
                 } else {
                     Toast.makeText(ctx, "جاري اختبار الاتصال...", Toast.LENGTH_SHORT).show()
                     Thread {
-                        val result = testConnection(server, user, pass)
+                        val result = runBlocking { testConnection(server, user, pass) }
                         (ctx as? android.app.Activity)?.runOnUiThread {
                             Toast.makeText(ctx, result, Toast.LENGTH_LONG).show()
                         }
@@ -119,7 +120,7 @@ class XtreamPlugin : Plugin() {
         ).apply { topMargin = 16 }
 
     /** Calls player_api.php without an action: returns account status/expiry as a user message. */
-    private fun testConnection(server: String, user: String, pass: String): String {
+    private suspend fun testConnection(server: String, user: String, pass: String): String {
         return try {
             val url = "$server/player_api.php?username=" +
                 XtreamSession.encode(user) + "&password=" + XtreamSession.encode(pass)
