@@ -1,5 +1,5 @@
 // Use an integer for version numbers
-version = 2
+version = 3
 
 cloudstream {
     description = "تشغيل اشتراك Xtream Codes (IPTV) داخل Cloudstream: قنوات مباشرة وأفلام ومسلسلات من سيرفرك"
