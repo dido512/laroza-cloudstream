@@ -112,7 +112,8 @@ class YallashootProvider : MainAPI() {
 
         // The player config lists every server:
         // var pj = {"data":{"sources":[{"name":"..","src":".."}, ...]}};
-        val servers = Regex(""""src"\s*:\s*"(https?:[^"]+)"""")
+        // The config may JSON-escape slashes (https:\/\/host); tolerate both.
+        val servers = Regex(""""src"\s*:\s*"(https?:\\?/\\?/[^"]+)"""")
             .findAll(embedHtml)
             .map { unescapeJson(it.groupValues[1]) }
             .distinct()
@@ -162,9 +163,16 @@ class YallashootProvider : MainAPI() {
         if (page.contains("ContentProtection", true) || page.contains("clearKeys", true) ||
             page.contains("widevine", true) || page.contains("licenseUrl", true)) return false
 
-        // 1. A stream URL right on the page (possibly JSON-escaped)
+        // 1. A stream URL right on the page (possibly JSON-escaped). Some
+        // players hide the real markup in a document.write of \xNN-escaped
+        // HTML; unwrap that first so their config is scanned too.
+        val unwrapped = if (page.contains("document.write(") && page.contains("\\x")) {
+            Regex("""document\.write\("(.*?)"\)""", RegexOption.DOT_MATCHES_ALL)
+                .find(page)?.groupValues?.get(1)?.let { unescapeHex(it) }
+        } else null
+        val scanText = if (unwrapped != null) page + "\n" + unwrapped else page
         val directStreams = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
-            .findAll(unescapeJson(page))
+            .findAll(unescapeJson(scanText))
             .map { unescapeJson(it.value) }
             .distinct()
             .toList()
@@ -255,6 +263,31 @@ class YallashootProvider : MainAPI() {
     private val observedApiHosts = setOf("nexa.st", "kora.st")
     // Sources confirmed unavailable during validation, not challenge bypass targets.
     private val unavailableHosts = setOf("dynbush.net", "edge.wedd48c.top", "hls.lshls.st")
+
+    private fun unescapeHex(value: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i < value.length) {
+            if (value[i] == '\\' && i + 3 < value.length &&
+                (value[i + 1] == 'x' || value[i + 1] == 'X')
+            ) {
+                val hex = value.substring(i + 2, i + 4).toIntOrNull(16)
+                if (hex != null) {
+                    sb.append(hex.toChar())
+                    i += 4
+                    continue
+                }
+            }
+            if (value[i] == '\\' && i + 1 < value.length) {
+                sb.append(value[i + 1])
+                i += 2
+                continue
+            }
+            sb.append(value[i])
+            i++
+        }
+        return sb.toString()
+    }
 
     private fun unescapeJson(value: String): String {
         return value
