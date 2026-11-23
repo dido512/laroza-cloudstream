@@ -744,8 +744,11 @@ class StalkerProvider : MainAPI() {
             else -> null
         } ?: throw ErrorLoadingException("المحتوى غير موجود في كتالوج البوابة")
 
-        // Ask the portal for a temporary stream link; fall back to the static cmd.
-        val linkCmd: String? = runCatching {
+        // Ask the portal for a temporary stream link. The static cmd fallback
+        // is only for portals where link-generation is unsupported/absent; an
+        // auth denial (expired token, rejected MAC) must surface, never fall
+        // back to the static link as if playback were authorized.
+        val linkCmd: String? = try {
             val type = if (kind == "live") "itv" else "vod"
             val extra = mutableMapOf(
                 "cmd" to rawCmd,
@@ -754,7 +757,11 @@ class StalkerProvider : MainAPI() {
             )
             if (seriesEp != null) extra["series"] = seriesEp
             StalkerSession.request(type, "create_link", extra).path("js").path("cmd").asText(null)
-        }.getOrNull()
+        } catch (e: StalkerSession.AuthException) {
+            throw ErrorLoadingException("البوابة رفضت التشغيل. تأكد أن الاشتراك والجهاز مفعّلان.")
+        } catch (e: Exception) {
+            null
+        }
 
         val streamUrl = resolveStreamUrl(linkCmd ?: rawCmd)
             ?: throw ErrorLoadingException("البوابة لم ترجع رابط تشغيل")
