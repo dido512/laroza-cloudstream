@@ -106,7 +106,7 @@ object StalkerSession {
     }
 
     private fun headers(): Map<String, String> {
-        val h = magHeaders(withReferer = true)
+        val h = magHeaders(withReferer = true).toMutableMap()
         if (fullPortal) token?.let { h["Authorization"] = "Bearer $it" }
         return h
     }
