@@ -45,7 +45,7 @@ class XtreamPlugin : Plugin() {
         val dp = ctx.resources.displayMetrics.density
 
         val serverInput = EditText(ctx).apply {
-            hint = "رابط السيرفر (يفضّل https:// لو الاشتراك بيدعمه)"
+            hint = "رابط السيرفر أو لينك M3U للاشتراك (get.php?username=...)"
             setText(prefs.getString(KEY_SERVER, ""))
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
@@ -69,7 +69,7 @@ class XtreamPlugin : Plugin() {
         }
 
         layout.addView(TextView(ctx).apply {
-            text = "اختر الأقسام هنا. الصفحة تحمل القسم المختار فقط. البحث الشامل حسب دعم السيرفر، وإلا فهو جزئي في الأقسام المفتوحة فقط. احفظ بيانات الدخول أولاً قبل اختيار الأقسام."
+            text = "تقدر تلصق لينك M3U في خانة السيرفر وهيتقسّم لوحده لسيرفر واسم مستخدم وكلمة مرور بنفس الخصائص. اختر الأقسام هنا. الصفحة تحمل القسم المختار فقط. البحث الشامل حسب دعم السيرفر، وإلا فهو جزئي في الأقسام المفتوحة فقط. احفظ بيانات الدخول أولاً قبل اختيار الأقسام."
         }, rowLp())
         for ((kind, label) in listOf("live" to "القنوات", "movie" to "الأفلام", "series" to "المسلسلات")) {
             layout.addView(Button(ctx).apply {
@@ -105,11 +105,23 @@ class XtreamPlugin : Plugin() {
             }, rowLp())
         }
 
-        fun readInputs(): Triple<String, String, String> = Triple(
-            XtreamSession.normalizeServer(serverInput.text.toString()),
-            userInput.text.toString().trim(),
-            passInput.text.toString()
-        )
+        // Pasting an Xtream M3U/API link into the server field splits it into
+        // server + username + password: one box, same features, no playlist
+        // download. Links without Xtream credentials stay a plain server.
+        fun readInputs(): Triple<String, String, String> {
+            val parsed = XtreamSession.parseXtreamLink(serverInput.text.toString())
+            if (parsed != null) {
+                serverInput.setText(parsed.first)
+                userInput.setText(parsed.second)
+                passInput.setText(parsed.third)
+                return parsed
+            }
+            return Triple(
+                XtreamSession.normalizeServer(serverInput.text.toString()),
+                userInput.text.toString().trim(),
+                passInput.text.toString()
+            )
+        }
 
         val dialog = AlertDialog.Builder(ctx)
             .setTitle("بيانات اشتراك Xtream")
