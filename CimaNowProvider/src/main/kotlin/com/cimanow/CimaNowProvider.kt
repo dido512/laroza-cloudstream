@@ -173,7 +173,7 @@ class CimaNowProvider : MainAPI() {
         private val interstitialHost = "https://rm.freex2line.online"
     private val interstitialReferer = "https://rm.freex2line.online/2020/02/blog-post.html/"
 
-    // DIAGNOSTIC v3. The script also sends a state beacon to diag.invalid (intercepted
+    // DIAGNOSTIC v5. The script also sends a state beacon to diag.invalid (intercepted
     // by the resolver, never sent anywhere) so we can see where the interstitial stops.
     private val armScript = """
         (function(){
@@ -216,7 +216,12 @@ class CimaNowProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val diag = StringBuilder()
-        fun d(s: String) { if (diag.isNotEmpty()) diag.append(" | "); diag.append(s) }
+        fun d(s: String) {
+            if (diag.isNotEmpty()) diag.append(" | ")
+            diag.append(s)
+            android.util.Log.w("CimaNowDiag", "CimaNow v5 diag: " + s.take(350))
+        }
+        android.util.Log.w("CimaNowDiag", "CimaNow v5 diag: loadLinks start")
         var found = false
         try {
             val filmUrl = data.trimEnd('/')
@@ -303,8 +308,8 @@ class CimaNowProvider : MainAPI() {
             d("ERR " + e.javaClass.simpleName)
         }
         if (!found) {
-            // Supported diagnostic surfaces only: app logcat (Settings > Show logcat, tag CimaNowDiag) and a toast.
-            val msg = "CimaNow v3 diag: " + diag.toString().take(400)
+            // Supported diagnostic surface: app logcat (Settings > Show logcat, tag CimaNowDiag).
+            val msg = "CimaNow v5 diag: " + diag.toString().take(400)
             android.util.Log.w("CimaNowDiag", msg)
         }
         return found
