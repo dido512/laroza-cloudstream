@@ -184,6 +184,47 @@ class YallashootProvider : MainAPI() {
             if (emitted) return true
         }
 
+        // 1b. AlbaPlayer variants keep the HLS URL base64-encoded, either in
+        // the classic AlbaPlayerControl('<b64>', 'hls') call or the v14
+        // plugin's data-src attribute (comma-separated fallbacks; first is primary).
+        val albaStreams = mutableListOf<String>()
+        Regex("""AlbaPlayerControl\(['"]([A-Za-z0-9+/=]+)['"],\s*['"]hls['"]\)""")
+            .findAll(page).forEach { match ->
+                runCatching { decodeBase64(match.groupValues[1]) }.getOrNull()?.let { albaStreams.add(it) }
+            }
+        val albaStreamDomains = Regex("""__APLR_ALLOWED_STREAM_DOMAINS\s*=\s*\[([^\]]*)\]""")
+            .find(page)?.groupValues?.get(1)
+            ?.let { body -> Regex(""""([A-Za-z0-9.-]+)"""").findAll(body).map { it.groupValues[1] }.toList() }
+            .orEmpty()
+        for (tag in Regex("""<div[^>]*class="aplr-player-container"[^>]*>""").findAll(page)) {
+            val dataSrc = Regex("""data-src="([^"]+)"""").find(tag.value)?.groupValues?.get(1) ?: continue
+            val decoded = if (Regex("""data-encoded="true"""").containsMatchIn(tag.value)) {
+                runCatching { decodeBase64(dataSrc) }.getOrNull()
+            } else dataSrc
+            val direct = decoded?.split(',')?.map { it.trim() }?.firstOrNull { it.contains(".m3u8") }
+            if (direct != null) {
+                albaStreams.add(direct)
+            } else {
+                // v14 non-direct mode: data-src holds a channel id and the plugin
+                // plays https://<random 12-32 lowercase subdomain>.<allowed domain>/hls/<id>/master.m3u8
+                val channel = decoded?.takeIf { it.matches(Regex("""[A-Za-z0-9_-]{1,32}""")) } ?: continue
+                if (albaStreamDomains.isEmpty()) continue
+                val subdomain = buildAlbaSubdomain()
+                albaStreamDomains.forEach { domain ->
+                    albaStreams.add("https://$subdomain.$domain/hls/$channel/master.m3u8")
+                }
+            }
+        }
+        var albaEmitted = false
+        for (stream in albaStreams.filter { it.contains(".m3u8") }.distinct().take(8)) {
+            try {
+                albaEmitted = emitUnencryptedHls(stream, clean, name, emptyMap(), callback) || albaEmitted
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) { }
+        }
+        if (albaEmitted) return true
+
         // 2. The NexaST/KoraST style API that returns the real embed URL
         val host = Regex("""https?://([^/?\s]+)""").find(clean)?.groupValues?.get(1)
         val channelId = Regex("""[?&]id=(\d+)""").find(clean)?.groupValues?.get(1)
@@ -263,6 +304,40 @@ class YallashootProvider : MainAPI() {
     private val observedApiHosts = setOf("nexa.st", "kora.st")
     // Sources confirmed unavailable during validation, not challenge bypass targets.
     private val unavailableHosts = setOf("dynbush.net", "edge.wedd48c.top", "hls.lshls.st")
+
+    // Mirrors the v14 plugin's generateSubdomain(): 12-32 random lowercase
+    // letters with no equal neighbours; any value in that shape resolves.
+    private fun buildAlbaSubdomain(): String {
+        val chars = 'a'..'z'
+        val length = 12 + kotlin.random.Random.nextInt(21)
+        val builder = StringBuilder(length)
+        while (builder.length < length) {
+            val next = chars.random()
+            if (builder.isNotEmpty() && builder[builder.length - 1] == next) continue
+            builder.append(next)
+        }
+        return builder.toString()
+    }
+
+    // Pure decoder keeps this provider compatible with Android API 21 and JVM.
+    private fun decodeBase64(value: String): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        val out = java.io.ByteArrayOutputStream()
+        var bits = 0
+        var count = 0
+        for (char in value) {
+            if (char == '=') break
+            val digit = alphabet.indexOf(char)
+            require(digit >= 0)
+            bits = (bits shl 6) or digit
+            count += 6
+            if (count >= 8) {
+                count -= 8
+                out.write((bits shr count) and 255)
+            }
+        }
+        return out.toByteArray().toString(Charsets.UTF_8)
+    }
 
     private fun unescapeHex(value: String): String {
         val sb = StringBuilder()
