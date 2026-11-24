@@ -26,10 +26,17 @@ class Yala5LiveProvider : MainAPI() {
     private fun decode(value: String) = URLDecoder.decode(value, "UTF-8")
     private val blogHost = "worldwaro1.blogspot.com"
 
-    private val pageHosts = setOf(blogHost, "xi.yallamo.cfd", "pl.matchlivehd.com", "2cdn.syria-player.info")
+    private val pageHosts = setOf(
+        blogHost, "xi.yallamo.cfd", "pl.matchlivehd.com", "2cdn.syria-player.info",
+        "go.yalla1live.xyz", "new.yallashootstream.com"
+    )
+    // Numbered redirector subdomains rotate (1., 2., ...), so allow the whole domain.
+    private val pageSuffixes = listOf(".draximo.site", ".korasimo.xyz")
     private fun allowedPage(url: String): Boolean = runCatching {
         val uri = URI(url)
-        uri.scheme in setOf("https", "http") && uri.host in pageHosts &&
+        val host = uri.host.orEmpty()
+        uri.scheme in setOf("https", "http") &&
+            (host in pageHosts || pageSuffixes.any { host.endsWith(it) }) &&
             uri.userInfo == null && (uri.port == -1 || uri.port in setOf(80, 443))
     }.getOrDefault(false)
 
@@ -147,9 +154,26 @@ class Yala5LiveProvider : MainAPI() {
                             .findAll(script.data()).forEach { streams.add(it.groupValues[1]) }
                     }
                 }
-                if (host == "2cdn.syria-player.info") {
-                    Regex("""const\s+streamUrl\s*=\s*"([^"]+)"""").find(unwrapped)
-                        ?.groupValues?.get(1)?.let { streams.add(it) }
+                // Plain stream assignments (Syria Player, Korasimo/Clappr pages).
+                Regex("""(?:const|let|var)\s+streamUrl\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"""")
+                    .findAll(unwrapped).forEach { streams.add(it.groupValues[1]) }
+                // AlbaPlayer v14 keeps the stream base64 in a data attribute,
+                // sometimes with comma-separated fallbacks; first entry is primary.
+                for (container in document.select(".aplr-player-container[data-src]")) {
+                    val rawSrc = container.attr("data-src").trim()
+                    val decodedSrc = if (container.attr("data-encoded").equals("true", ignoreCase = true)) {
+                        runCatching { decodeBase64(rawSrc) }.getOrNull()
+                    } else rawSrc
+                    decodedSrc?.split(',')?.map { it.trim() }
+                        ?.firstOrNull { it.contains(".m3u8") }?.let { streams.add(it) }
+                }
+                if (host == "go.yalla1live.xyz") {
+                    // player.html serves the HLS playlist at a disguised path:
+                    // /live/<ch>/cover.webp, with ch from ?ch= (default "main").
+                    val ch = URI(response.url).rawQuery.orEmpty().split('&')
+                        .firstOrNull { it.startsWith("ch=") }?.removePrefix("ch=")
+                        ?.takeIf { it.matches(Regex("[A-Za-z0-9_-]+")) } ?: "main"
+                    streams.add("https://go.yalla1live.xyz/live/$ch/cover.webp")
                 }
                 if (host == "pl.matchlivehd.com") {
                     for (script in document.select(".aplr-player-content script:not([src])")) {
@@ -183,18 +207,18 @@ class Yala5LiveProvider : MainAPI() {
                 // Keep collecting every supported server, even after one plays.
                 nextPages.addAll(document.select("iframe#playerframe[src], .posts-body iframe[src], .post-body iframe[src], .aplr-player-content iframe[src]")
                     .map { it.absUrl("src") }.filter { allowedPage(it) })
-                if (host == "xi.yallamo.cfd" || host == "pl.matchlivehd.com") {
-                    nextPages.addAll(document.select(".aplr-menu a[href]")
-                        .map { it.absUrl("href") }.filter { allowedPage(it) })
-                }
-                // Prefer the public normal player path over the secondary Alba
-                // fallback, but never invent channel URLs or modify server IDs.
+                nextPages.addAll(document.select(".aplr-menu a[href]")
+                    .map { it.absUrl("href") }.filter { allowedPage(it) })
+                // Prefer the site's own default player first, then the public
+                // normal player path over the secondary Alba fallback, but never
+                // invent channel URLs or modify server IDs.
                 val ordered = nextPages.distinct().sortedBy {
                     when (runCatching { URI(it).host }.getOrNull()) {
-                        "2cdn.syria-player.info" -> 0
-                        "xi.yallamo.cfd" -> 1
-                        "pl.matchlivehd.com" -> 2
-                        else -> 0
+                        "go.yalla1live.xyz" -> 0
+                        "2cdn.syria-player.info" -> 1
+                        "xi.yallamo.cfd" -> 2
+                        "pl.matchlivehd.com" -> 3
+                        else -> 4
                     }
                 }
                 if (ordered.size > 16) return false
@@ -264,4 +288,4 @@ class Yala5LiveProvider : MainAPI() {
         }
         return inspect(url, 0)
     }
-}
+                          }
