@@ -5,5 +5,5 @@ cloudstream {
     authors = listOf("Mahmoud")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
-    isCrossPlatform = true
+    isCrossPlatform = false
 }
