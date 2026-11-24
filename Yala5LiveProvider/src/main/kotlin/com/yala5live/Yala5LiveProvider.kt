@@ -27,11 +27,11 @@ class Yala5LiveProvider : MainAPI() {
     private val blogHost = "worldwaro1.blogspot.com"
 
     private val pageHosts = setOf(
-        blogHost, "xi.yallamo.cfd", "pl.matchlivehd.com", "2cdn.syria-player.info",
-        "go.yalla1live.xyz", "new.yallashootstream.com"
+        blogHost, "xi.yallamo.cfd", "xi.yallato.cfd", "pl.matchlivehd.com", "2cdn.syria-player.info",
+        "go.yalla1live.xyz", "new.yallashootstream.com", "futbol.fonts4copy.online", "traitaunt.net"
     )
     // Numbered redirector subdomains rotate (1., 2., ...), so allow the whole domain.
-    private val pageSuffixes = listOf(".draximo.site", ".korasimo.xyz")
+    private val pageSuffixes = listOf(".draximo.site", ".korasimo.xyz", ".sportsonlinee.click")
     private fun allowedPage(url: String): Boolean = runCatching {
         val uri = URI(url)
         val host = uri.host.orEmpty()
@@ -41,6 +41,18 @@ class Yala5LiveProvider : MainAPI() {
     }.getOrDefault(false)
 
     private fun hostOf(url: String): String? = runCatching { URI(url).host }.getOrNull()
+
+    /** go.yalla1live.xyz serves the HLS playlist at /live/<ch>/cover.webp; the channel
+     * id appears as ?ch= or in the /live/<ch>/player.html path, depending on the page. */
+    private fun yallaCoverStream(pageUrl: String): String? {
+        val uri = runCatching { URI(pageUrl) }.getOrNull() ?: return null
+        if (uri.host != "go.yalla1live.xyz") return null
+        val ch = uri.rawQuery.orEmpty().split('&').firstOrNull { it.startsWith("ch=") }?.removePrefix("ch=")
+            ?: Regex("""^/live/([A-Za-z0-9_-]+)""").find(uri.path.orEmpty())?.groupValues?.get(1)
+            ?: "main"
+        if (!ch.matches(Regex("[A-Za-z0-9_-]+"))) return null
+        return "https://go.yalla1live.xyz/live/$ch/cover.webp"
+    }
 
     private fun isBlogPage(url: String): Boolean = hostOf(url) == blogHost && allowedPage(url)
 
@@ -118,7 +130,7 @@ class Yala5LiveProvider : MainAPI() {
             if (depth > 7 || visited.size >= 48 || !(allowedPage(url) || isShortLink(url)) || !visited.add(url)) return false
             try {
                 val response = app.get(url, referer = referer, timeout = 10L)
-                if (response.code !in 200..299 || !allowedPage(response.url)) return false
+                if (response.code !in 200..299 || !(allowedPage(response.url) || isShortLink(response.url))) return false
                 val host = URI(response.url).host
                 val raw = response.text
                 // Syria Player's normal document.write wrapper is hex-escaped
@@ -144,16 +156,48 @@ class Yala5LiveProvider : MainAPI() {
                         val uri = runCatching { URI(response.url).resolve(candidate) }.getOrNull() ?: continue
                         if (uri.scheme !in setOf("http", "https") || uri.userInfo != null) continue
                         if (uri.path.endsWith(".m3u8", ignoreCase = true)) streams.add(uri.toString())
-                        else if (allowedPage(uri.toString())) nextPages.add(uri.toString())
+                        else if (allowedPage(uri.toString())) {
+                            val cover = yallaCoverStream(uri.toString())
+                            if (cover != null) streams.add(cover) else nextPages.add(uri.toString())
+                        }
                     }
                 }
-                if (host == "xi.yallamo.cfd") {
-                    // Observed AlbaPlayer mobile/desktop config repeats the
-                    // same plain HLS in a video src and Clappr source field.
-                    for (script in document.select(".aplr-player-content script:not([src])")) {
-                        Regex("""source\s*:\s*["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']""")
-                            .findAll(script.data()).forEach { streams.add(it.groupValues[1]) }
-                    }
+                // AlbaPlayer pages repeat the plain HLS in a video src or Clappr
+                // source field; applies to yallamo/yallato and their mirrors.
+                for (script in document.select(".aplr-player-content script:not([src])")) {
+                    Regex("""source\s*:\s*["'](https?://[^"'\s]+\.m3u8[^"'\s]*)["']""")
+                        .findAll(script.data()).forEach { streams.add(it.groupValues[1]) }
+                }
+                // Short links (t.co) answer with a meta refresh or location.replace
+                // interstitial instead of an HTTP redirect; follow the target.
+                if (host == "t.co") {
+                    Regex("""URL=(https?://[^"'\s>]+)""", RegexOption.IGNORE_CASE)
+                        .find(unwrapped)?.groupValues?.get(1)?.let { nextPages.add(it) }
+                    Regex("""location\.replace\(["']([^"']+)["']\)""")
+                        .find(unwrapped)?.groupValues?.get(1)?.let { nextPages.add(it.replace("\\/", "/")) }
+                }
+                // traitaunt.net embeds keep the stream config in window._econfig:
+                // base64 -> 4 chunks -> drop char index 3 per chunk -> base64 each ->
+                // reorder [2,0,3,1] -> join -> base64 -> JSON with stream_url(_nop2p).
+                if (host == "traitaunt.net") {
+                    Regex("""window\._econfig='([A-Za-z0-9+/=]+)'""").find(unwrapped)
+                        ?.groupValues?.get(1)?.let { cfg ->
+                            runCatching {
+                                val first = decodeBase64(cfg)
+                                val chunkLen = (first.length + 3) / 4
+                                val order = intArrayOf(2, 0, 3, 1)
+                                val parts = arrayOfNulls<String>(4)
+                                for (j in 0 until 4) {
+                                    val start = j * chunkLen
+                                    val chunk = first.substring(start, minOf(start + chunkLen, first.length))
+                                    parts[order[j]] = decodeBase64(chunk.take(3) + chunk.drop(4))
+                                }
+                                val json = decodeBase64(parts.joinToString("") { it.orEmpty() })
+                                (Regex(""""stream_url_nop2p"\s*:\s*"([^"]+)"""").find(json)
+                                    ?: Regex(""""stream_url"\s*:\s*"([^"]+)"""").find(json))
+                                    ?.groupValues?.get(1)
+                            }.getOrNull()?.let { streams.add(it) }
+                        }
                 }
                 // Plain stream assignments (Syria Player, Korasimo/Clappr pages).
                 Regex("""(?:const|let|var)\s+streamUrl\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"""")
@@ -183,21 +227,18 @@ class Yala5LiveProvider : MainAPI() {
                 }
                 if (host == "go.yalla1live.xyz") {
                     // player.html serves the HLS playlist at a disguised path:
-                    // /live/<ch>/cover.webp, with ch from ?ch= (default "main").
-                    val ch = URI(response.url).rawQuery.orEmpty().split('&')
-                        .firstOrNull { it.startsWith("ch=") }?.removePrefix("ch=")
-                        ?.takeIf { it.matches(Regex("[A-Za-z0-9_-]+")) } ?: "main"
-                    streams.add("https://go.yalla1live.xyz/live/$ch/cover.webp")
+                    // /live/<ch>/cover.webp.
+                    yallaCoverStream(response.url)?.let { streams.add(it) }
                 }
-                if (host == "pl.matchlivehd.com") {
-                    for (script in document.select(".aplr-player-content script:not([src])")) {
-                        Regex("""AlbaPlayerControl\(['"]([A-Za-z0-9+/=]+)['"],\s*['"]hls['"]\)""")
-                            .find(script.data())?.groupValues?.get(1)?.let { encoded ->
-                                runCatching { decodeBase64(encoded) }
-                                    .getOrNull()?.let { streams.add(it) }
-                            }
-                    }
+                for (script in document.select(".aplr-player-content script:not([src])")) {
+                    Regex("""AlbaPlayerControl\(['"]([A-Za-z0-9+/=]+)['"],\s*['"]hls['"]\)""")
+                        .find(script.data())?.groupValues?.get(1)?.let { encoded ->
+                            runCatching { decodeBase64(encoded) }
+                                .getOrNull()?.let { streams.add(it) }
+                        }
                 }
+                // traitaunt's CDN answers the playlist only for the site-root referer.
+                val streamReferer = if (host == "traitaunt.net") "https://traitaunt.net/" else response.url
                 var found = false
                 for (stream in streams.distinct()) {
                     val uri = runCatching { URI(stream) }.getOrNull() ?: continue
@@ -207,7 +248,7 @@ class Yala5LiveProvider : MainAPI() {
                         // check cannot reach the stream (network error, 403 from
                         // this client), still offer the server so the player can try.
                         val verdict = if (!emitted.add(stream)) false else try {
-                            unencryptedHls(stream, response.url)
+                            unencryptedHls(stream, streamReferer)
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (_: Exception) { true }
                         if (verdict) {
@@ -219,7 +260,7 @@ class Yala5LiveProvider : MainAPI() {
                             val label = listOf(host, pageUri.path.trimEnd('/').substringAfterLast('/').take(24), serverTag, streamTail)
                                 .filter { it.isNotBlank() }.joinToString(" / ")
                             callback(newExtractorLink(name, label, stream, ExtractorLinkType.M3U8) {
-                                this.referer = response.url
+                                this.referer = streamReferer
                             })
                             found = true
                         }
@@ -246,10 +287,24 @@ class Yala5LiveProvider : MainAPI() {
                     }
                 }
                 // Keep collecting every supported server, even after one plays.
-                nextPages.addAll(document.select("iframe#playerframe[src], .posts-body iframe[src], .post-body iframe[src], .aplr-player-content iframe[src]")
-                    .map { it.absUrl("src") }.filter { allowedPage(it) })
-                nextPages.addAll(document.select(".aplr-menu a[href]")
-                    .map { it.absUrl("href") }.filter { allowedPage(it) })
+                val discovered = mutableListOf<String>()
+                discovered.addAll(document.select("iframe#playerframe[src], .posts-body iframe[src], .post-body iframe[src], .aplr-player-content iframe[src], iframe.cf[src]")
+                    .map { it.absUrl("src") })
+                discovered.addAll(document.select(".aplr-menu a[href]")
+                    .map { it.absUrl("href") })
+                // Alostora-style pages switch servers with changePlayer buttons.
+                discovered.addAll(document.select("button[onclick]").mapNotNull {
+                    Regex("""['"](https?://[^'"]+)['"]""").find(it.attr("onclick"))?.groupValues?.get(1)
+                })
+                // Thin wrapper hosts hold a single content iframe among ad frames.
+                if (host == "sportsonlinee.click" || host.endsWith(".sportsonlinee.click")) {
+                    discovered.addAll(document.select("iframe[src]").map { it.absUrl("src") })
+                }
+                for (page in discovered) {
+                    if (!allowedPage(page)) continue
+                    val cover = yallaCoverStream(page)
+                    if (cover != null) streams.add(cover) else nextPages.add(page)
+                }
                 // Prefer the site's own default player first, then the public
                 // normal player path over the secondary Alba fallback, but never
                 // invent channel URLs or modify server IDs.
