@@ -306,11 +306,6 @@ class CimaNowProvider : MainAPI() {
             // Supported diagnostic surfaces only: app logcat (Settings > Show logcat, tag CimaNowDiag) and a toast.
             val msg = "CimaNow v3 diag: " + diag.toString().take(400)
             android.util.Log.w("CimaNowDiag", msg)
-            runCatching {
-                com.lagradost.cloudstream3.utils.Coroutines.main {
-                    com.lagradost.cloudstream3.CommonActivity.showToast(msg.take(220))
-                }
-            }
         }
         return found
     }
