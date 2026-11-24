@@ -1,7 +1,7 @@
-version = 4
+version = 5
 
 cloudstream {
-    description = "سيما ناو: أفلام ومسلسلات عربية وأجنبية (تشخيص v4: التشغيل تجريبي)"
+    description = "سيما ناو: أفلام ومسلسلات عربية وأجنبية (تشخيص v5: التشغيل تجريبي)"
     authors = listOf("Mahmoud")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
