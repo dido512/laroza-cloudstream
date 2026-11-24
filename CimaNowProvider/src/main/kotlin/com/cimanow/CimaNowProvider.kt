@@ -2,6 +2,7 @@ package com.cimanow
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -169,42 +170,101 @@ class CimaNowProvider : MainAPI() {
         }
     }
 
+    private val interstitialHost = "https://rm.freex2line.online"
+    private val interstitialReferer = "https://rm.freex2line.online/2020/02/blog-post.html/"
+
+    // EXPERIMENTAL. Runs inside the app's WebView so the interstitial's own scripts
+    // (Turnstile + token fetch) execute; we wait for the /watching/?token= navigation.
+    private val armScript = """
+        (function(){
+          try { window.open = function(){ return null; }; } catch(e) {}
+          var n = 0;
+          var t = setInterval(function(){
+            n++;
+            var b = document.getElementById('downloadbtn');
+            if (b && b.getAttribute('data-link-ready') === '1') {
+              b.hidden = false;
+              ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(e){
+                b.dispatchEvent(new MouseEvent(e, {bubbles:true, cancelable:true, view:window}));
+              });
+              try { b.click(); } catch(e) {}
+            }
+            if (n > 90) clearInterval(t);
+          }, 750);
+          return 'armed';
+        })();
+    """.trimIndent()
+
+    private fun b64(s: String): String =
+        android.util.Base64.encodeToString(s.toByteArray(), android.util.Base64.NO_WRAP)
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // The site's watch flow: content page -> rm.freex2line.online/loadon interstitial
-        // (10s countdown + Cloudflare Turnstile) -> /watching/?token=<server-issued token>.
-        // The token is gated by Turnstile and anti-automation checks that explicitly detect
-        // CloudStream by name, so it cannot be minted by plain HTTP requests. We still try
-        // the watch page directly: if the site serves it (weakened checks, token reuse),
-        // parse what is statically present. Forafile stream URLs ship inside the page as
-        // an ffQualities JSON object.
-        val watchUrl = data.trimEnd('/') + "/watching/"
-        val doc = runCatching { app.get(watchUrl).document }.getOrNull() ?: return false
+        // Flow (verified in a desktop browser): film page has a loadon link (base64 of
+        // <film>/watching/). The interstitial fetches a per-film token after Turnstile and
+        // then navigates to <film>/watching/?token=...; that page only opens with a Referer
+        // from the interstitial site. Token is static per film but cannot be derived.
+        val filmUrl = data.trimEnd('/')
+        val loadon = runCatching {
+            app.get(data).document.selectFirst("a[href*=\"loadon/?link=\"]")?.attr("href")
+        }.getOrNull().takeUnless { it.isNullOrEmpty() }
+            ?: "$interstitialHost/loadon/?link=" + b64("$filmUrl/watching/")
+
+        val resolver = WebViewResolver(
+            interceptUrl = Regex("""cimanow\.cc/.+/watching/\?token="""),
+            additionalUrls = emptyList(),
+            script = armScript,
+            scriptCallback = { },
+            timeout = 70_000L
+        )
+        val req = runCatching { resolver.resolveUsingWebView(loadon).first }.getOrNull()
+            ?: return false
+        val watchUrl = req.url.toString()
+
+        val hdrs = HashMap<String, String>()
+        runCatching {
+            req.headers.toMultimap().forEach { (k, v) -> hdrs[k] = v.joinToString(", ") }
+        }
+        hdrs["Referer"] = interstitialReferer
+        val doc = runCatching { app.get(watchUrl, headers = hdrs).document }.getOrNull()
+            ?: return false
+        val html = doc.html()
         var found = false
 
-        Regex("\"Ff(\\d+)\":\\s*\"(https?://[^\"]+)\"").findAll(doc.html()).forEach { m ->
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = "Forafile",
-                    url = m.groupValues[2],
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = watchUrl
-                    this.quality = m.groupValues[1].toIntOrNull() ?: Qualities.Unknown.value
-                }
-            )
-            found = true
+        // Forafile entries are file-host pages (.mp4.html), not direct video.
+        Regex("\"Ff(\\d+)\":\\s*\"(https?://[^\"]+)\"").findAll(html).forEach { m ->
+            val q = m.groupValues[1].toIntOrNull() ?: Qualities.Unknown.value
+            val pageUrl = m.groupValues[2]
+            var ok = runCatching { loadExtractor(pageUrl, watchUrl, subtitleCallback, callback) }.getOrDefault(false)
+            if (!ok) {
+                val text = runCatching { app.get(pageUrl, referer = watchUrl).text }.getOrNull().orEmpty()
+                Regex("(?:file|src)\\s*[:=]\\s*[\"'](https?://[^\"']+\\.(?:mp4|m3u8)[^\"']*)")
+                    .find(text)?.groupValues?.get(1)?.let { direct ->
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "Forafile ${q}p",
+                                url = direct,
+                                type = if (direct.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = pageUrl
+                                this.quality = q
+                            }
+                        )
+                        ok = true
+                    }
+            }
+            found = found || ok
         }
 
-        // Watch servers (<li data-id data-index>) resolve through signed core.php calls
-        // (anti-bot JS) and cannot be replayed; emit any static embed iframe if present.
-        doc.select("li[aria-label=\"embed\"] iframe[src^=\"http\"]").forEach { iframe ->
-            found = loadExtractor(iframe.attr("src"), watchUrl, subtitleCallback, callback) || found
+        // Any static embed (other servers are switched through signed core.php calls).
+        doc.select("iframe[src^=\"http\"], iframe[data-src^=\"http\"]").forEach { f ->
+            val src = f.attr("src").ifEmpty { f.attr("data-src") }
+            found = runCatching { loadExtractor(src, watchUrl, subtitleCallback, callback) }.getOrDefault(false) || found
         }
         return found
     }
