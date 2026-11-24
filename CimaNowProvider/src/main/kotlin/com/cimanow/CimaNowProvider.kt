@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 
 class CimaNowProvider : MainAPI() {
@@ -127,7 +128,7 @@ class CimaNowProvider : MainAPI() {
             searchResponse(
                 a.attr("href"), rTitle,
                 img?.attr("src")?.ifEmpty { img.attr("data-src") },
-                null, Qualities.Unknown.value
+                null
             )
         }
 
