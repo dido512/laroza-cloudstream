@@ -133,6 +133,7 @@ class Yala5LiveProvider : MainAPI() {
                 } else raw
                 val document = org.jsoup.Jsoup.parse(unwrapped, response.url)
                 val streams = mutableListOf<String>()
+                val generated = mutableListOf<List<String>>()
                 val nextPages = mutableListOf<String>()
                 for (template in document.select("template#albaSrc")) {
                     val lines = org.jsoup.parser.Parser.unescapeEntities(template.html(), false)
@@ -164,8 +165,21 @@ class Yala5LiveProvider : MainAPI() {
                     val decodedSrc = if (container.attr("data-encoded").equals("true", ignoreCase = true)) {
                         runCatching { decodeBase64(rawSrc) }.getOrNull()
                     } else rawSrc
-                    decodedSrc?.split(',')?.map { it.trim() }
-                        ?.firstOrNull { it.contains(".m3u8") }?.let { streams.add(it) }
+                    // Every comma-separated entry is a separate channel/server.
+                    val entries = decodedSrc?.split(',')?.map { it.trim() }.orEmpty()
+                    val direct = entries.filter { it.contains(".m3u8") }
+                    if (direct.isNotEmpty()) direct.forEach { streams.add(it) }
+                    else if (container.attr("data-direct").equals("false", ignoreCase = true)) {
+                        // AlbaPlayer v14 non-direct mode: data-src is a channel id and the
+                        // player opens https://<random subdomain>.<allowed domain>/hls/<id>/master.m3u8.
+                        // Any 12-32 letter subdomain resolves; try the page's own domain list.
+                        val domains = Regex("[A-Za-z0-9.-]+").findAll(
+                            org.jsoup.parser.Parser.unescapeEntities(container.attr("data-domains"), false)
+                        ).map { it.value }.filter { it.contains('.') }.toList()
+                        for (channel in entries.filter { it.matches(Regex("[A-Za-z0-9_-]{1,32}")) }) {
+                            generated.add(domains.map { "https://${albaSubdomain()}.$it/hls/$channel/master.m3u8" })
+                        }
+                    }
                 }
                 if (host == "go.yalla1live.xyz") {
                     // player.html serves the HLS playlist at a disguised path:
@@ -189,12 +203,20 @@ class Yala5LiveProvider : MainAPI() {
                     val uri = runCatching { URI(stream) }.getOrNull() ?: continue
                     if (uri.scheme !in setOf("https", "http") || uri.userInfo != null) continue
                     try {
-                        if (emitted.add(stream) && unencryptedHls(stream, response.url)) {
+                        // Skip only streams proven encrypted or not HLS. If the
+                        // check cannot reach the stream (network error, 403 from
+                        // this client), still offer the server so the player can try.
+                        val verdict = if (!emitted.add(stream)) false else try {
+                            unencryptedHls(stream, response.url)
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { true }
+                        if (verdict) {
                             val pageUri = URI(response.url)
                             val serverTag = pageUri.rawQuery.orEmpty().split('&')
                                 .firstOrNull { it.startsWith("serv=") || it.startsWith("channel=") }
                                 ?.take(32).orEmpty()
-                            val label = listOf(host, pageUri.path.trimEnd('/').substringAfterLast('/').take(24), serverTag)
+                            val streamTail = uri.path.split('/').filter { it.isNotBlank() }.takeLast(2).firstOrNull().orEmpty().take(16)
+                            val label = listOf(host, pageUri.path.trimEnd('/').substringAfterLast('/').take(24), serverTag, streamTail)
                                 .filter { it.isNotBlank() }.joinToString(" / ")
                             callback(newExtractorLink(name, label, stream, ExtractorLinkType.M3U8) {
                                 this.referer = response.url
@@ -203,6 +225,25 @@ class Yala5LiveProvider : MainAPI() {
                         }
                     } catch (cancelled: CancellationException) { throw cancelled }
                     catch (_: Exception) { }
+                }
+                for (group in generated) {
+                    // One working domain per channel is enough; they are mirrors.
+                    for (stream in group.take(6)) {
+                        val ok = try { unencryptedHls(stream, response.url, strict = true) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { false }
+                        if (ok && emitted.add(stream)) {
+                            val pageUri = URI(response.url)
+                            val label = listOf(host, pageUri.path.trimEnd('/').substringAfterLast('/').take(24),
+                                pageUri.rawQuery.orEmpty().take(16), stream.substringAfter("/hls/").substringBefore('/'))
+                                .filter { it.isNotBlank() }.joinToString(" / ")
+                            callback(newExtractorLink(name, label, stream, ExtractorLinkType.M3U8) {
+                                this.referer = response.url
+                            })
+                            found = true
+                            break
+                        }
+                    }
                 }
                 // Keep collecting every supported server, even after one plays.
                 nextPages.addAll(document.select("iframe#playerframe[src], .posts-body iframe[src], .post-body iframe[src], .aplr-player-content iframe[src]")
@@ -236,6 +277,17 @@ class Yala5LiveProvider : MainAPI() {
         }
     }
 
+    private fun albaSubdomain(): String {
+        val length = 12 + kotlin.random.Random.nextInt(21)
+        val builder = StringBuilder(length)
+        while (builder.length < length) {
+            val next = ('a'..'z').random()
+            if (builder.isNotEmpty() && builder[builder.length - 1] == next) continue
+            builder.append(next)
+        }
+        return builder.toString()
+    }
+
     // Pure decoder keeps this provider compatible with Android API 21 and JVM.
     private fun decodeBase64(value: String): String {
         val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -257,14 +309,16 @@ class Yala5LiveProvider : MainAPI() {
     }
 
     /** Keep the master URL so separate audio tracks and adaptive quality survive. */
-    private suspend fun unencryptedHls(url: String, referer: String): Boolean {
+    private suspend fun unencryptedHls(url: String, referer: String, strict: Boolean = false): Boolean {
         val checked = mutableSetOf<String>()
         suspend fun inspect(target: String, depth: Int): Boolean {
             if (depth > 3 || checked.size >= 32) return false
             if (!checked.add(target)) return true
             val response = app.get(target, referer = referer, timeout = 10L)
             val text = response.text.trim().removePrefix("\uFEFF")
-            if (response.code !in 200..299 || !text.startsWith("#EXTM3U")) return false
+            // Non-2xx means we could not inspect it: inconclusive, not encrypted.
+            if (response.code !in 200..299) return !strict
+            if (!text.startsWith("#EXTM3U")) return false
             val lines = text.lineSequence().map { it.trim() }.toList()
             val keys = lines.filter { it.startsWith("#EXT-X-KEY:") || it.startsWith("#EXT-X-SESSION-KEY:") }
             if (keys.any { !Regex("""(?:^|,)METHOD=NONE(?:,|$)""").containsMatchIn(it.substringAfter(':')) }) return false
