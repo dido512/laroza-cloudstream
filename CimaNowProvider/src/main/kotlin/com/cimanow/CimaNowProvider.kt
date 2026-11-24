@@ -3,6 +3,8 @@ package com.cimanow
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import org.jsoup.nodes.Element
 
@@ -24,27 +26,16 @@ class CimaNowProvider : MainAPI() {
         else -> TvType.TvSeries
     }
 
-    private fun qualityOf(text: String?): Int = when {
-        text == null -> Qualities.Unknown.value
-        text.contains("1080") -> Qualities.P1080.value
-        text.contains("720") -> Qualities.P720.value
-        text.contains("480") -> Qualities.P480.value
-        text.contains("360") -> Qualities.P360.value
-        else -> Qualities.Unknown.value
-    }
-
-    private fun searchResponse(url: String, title: String, poster: String?, year: Int?, quality: Int): SearchResponse {
+    private fun searchResponse(url: String, title: String, poster: String?, year: Int?): SearchResponse {
         return if (typeOf(url, title) == TvType.TvSeries) {
             newTvSeriesSearchResponse(title, url, TvType.TvSeries) {
                 this.posterUrl = poster
                 this.year = year
-                this.quality = quality
             }
         } else {
             newMovieSearchResponse(title, url, TvType.Movie) {
                 this.posterUrl = poster
                 this.year = year
-                this.quality = quality
             }
         }
     }
@@ -60,8 +51,7 @@ class CimaNowProvider : MainAPI() {
         val img = a.selectFirst("img")
         val poster = img?.attr("data-src")?.ifEmpty { img.attr("src") }
         val year = a.selectFirst("li[aria-label=\"year\"]")?.text()?.trim()?.toIntOrNull()
-        val quality = qualityOf(a.selectFirst("li[aria-label=\"ribbon\"]")?.text())
-        return searchResponse(url, title, poster, year, quality)
+        return searchResponse(url, title, poster, year)
     }
 
     /** Big featured/search cards: article > picture > a > img[src, alt=title]. */
@@ -74,7 +64,7 @@ class CimaNowProvider : MainAPI() {
         val article = a.parents().firstOrNull { it.tagName() == "article" }
         val year = article?.selectFirst("a[href*=\"release-year\"]")?.text()?.trim()?.toIntOrNull()
         val poster = img.attr("src").ifEmpty { img.attr("data-src") }
-        return searchResponse(url, title, poster, year, Qualities.Unknown.value)
+        return searchResponse(url, title, poster, year)
     }
 
     private fun cardsFrom(root: Element): List<SearchResponse> {
@@ -197,13 +187,15 @@ class CimaNowProvider : MainAPI() {
 
         Regex("\"Ff(\\d+)\":\\s*\"(https?://[^\"]+)\"").findAll(doc.html()).forEach { m ->
             callback.invoke(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "Forafile",
                     url = m.groupValues[2],
-                    referer = watchUrl,
-                    quality = m.groupValues[1].toIntOrNull() ?: Qualities.Unknown.value
-                )
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = watchUrl
+                    this.quality = m.groupValues[1].toIntOrNull() ?: Qualities.Unknown.value
+                }
             )
             found = true
         }
@@ -211,16 +203,7 @@ class CimaNowProvider : MainAPI() {
         // Watch servers (<li data-id data-index>) resolve through signed core.php calls
         // (anti-bot JS) and cannot be replayed; emit any static embed iframe if present.
         doc.select("li[aria-label=\"embed\"] iframe[src^=\"http\"]").forEach { iframe ->
-            callback.invoke(
-                ExtractorLink(
-                    source = name,
-                    name = "Cima Now",
-                    url = iframe.attr("src"),
-                    referer = watchUrl,
-                    quality = Qualities.Unknown.value
-                )
-            )
-            found = true
+            found = loadExtractor(iframe.attr("src"), watchUrl, subtitleCallback, callback) || found
         }
         return found
     }
