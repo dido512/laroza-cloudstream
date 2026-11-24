@@ -221,7 +221,7 @@ class CimaNowProvider : MainAPI() {
             scriptCallback = { },
             timeout = 70_000L
         )
-        val req = runCatching { resolver.resolveUsingWebView(loadon).first }.getOrNull()
+        val req = runCatching { resolver.resolveUsingWebView(url = loadon, referer = null, headers = emptyMap(), method = "GET", requestCallBack = { false }).first }.getOrNull()
             ?: return false
         val watchUrl = req.url.toString()
 
