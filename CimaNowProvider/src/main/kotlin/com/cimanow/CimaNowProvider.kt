@@ -237,47 +237,42 @@ class CimaNowProvider : MainAPI() {
         return url
     }
 
-    // DIAGNOSTIC v6. Beacons go to diag.invalid (intercepted by the resolver into its
-    // extra-request list, never sent anywhere real) so we can see interstitial state.
-    // The script is idempotent: WebViewResolver re-injects it on every intercepted request,
-    // and v5's unguarded interval spawned a new beacon loop per injection (request storm).
+    // DIAGNOSTIC v6. The script is idempotent: WebViewResolver re-injects it on every
+    // intercepted request and calls scriptCallback with its return value, so each
+    // reinjection reports the current interstitial state. No diagnostic network requests
+    // at all (v5 beaconed to a fake domain, which both stormed and failed DNS).
     private val armScript = """
         (function(){
-          if (window.__cnArm) { return 'armed'; }
+          function state(){
+            try {
+              var b = document.getElementById('downloadbtn');
+              var vis = false, ready = 'x';
+              if (b) {
+                try { vis = getComputedStyle(b).display !== 'none' && !b.hidden; } catch(e) {}
+                ready = b.getAttribute('data-link-ready') || 'x';
+              }
+              var tsr = '';
+              try { tsr = (document.querySelector('[name=cf-turnstile-response]') || {}).value || ''; } catch(e) {}
+              return 'host=' + location.host +
+                ';btn=' + (b ? (vis ? 'v' : 'h') : 'n') +
+                ';ready=' + ready +
+                ';tsr=' + tsr.length +
+                ';clk=' + (window.__cnClicks || 0) +
+                ';len=' + document.documentElement.innerHTML.length;
+            } catch(e) { return 'state-err'; }
+          }
+          if (window.__cnArm) { return state(); }
           window.__cnArm = 1;
+          window.__cnClicks = 0;
           try {
             window.open = function(u){
               try { if (u && /\/watching\//.test(String(u))) { window.location.href = u; } } catch(e) {}
               return null;
             };
           } catch(e) {}
-          var n = 0, clicks = 0, lastClick = -100, lastState = '';
-          function state(){
-            var b = document.getElementById('downloadbtn');
-            var vis = false, ready = 'x';
-            if (b) {
-              try { vis = getComputedStyle(b).display !== 'none' && !b.hidden; } catch(e) {}
-              ready = b.getAttribute('data-link-ready') || 'x';
-            }
-            var tsr = '';
-            try { tsr = (document.querySelector('[name=cf-turnstile-response]') || {}).value || ''; } catch(e) {}
-            return 'host=' + location.host +
-              ';btn=' + (b ? (vis ? 'v' : 'h') : 'n') +
-              ';ready=' + ready +
-              ';tsr=' + tsr.length +
-              ';clk=' + clicks +
-              ';len=' + document.documentElement.innerHTML.length;
-          }
-          function beacon(force){
-            var s = state();
-            if (!force && s === lastState) { return; }
-            lastState = s;
-            try { new Image().src = 'https://diag.invalid/s?' + encodeURIComponent('n=' + n + ';' + s); } catch(e) {}
-          }
-          beacon(true);
+          var n = 0, lastClick = -100;
           var t = setInterval(function(){
             n++;
-            beacon(false);
             try {
               var b = document.getElementById('downloadbtn');
               if (b) {
@@ -287,22 +282,21 @@ class CimaNowProvider : MainAPI() {
                 var tsr = '';
                 try { tsr = (document.querySelector('[name=cf-turnstile-response]') || {}).value || ''; } catch(e) {}
                 var go = vis && (ready || realHref || tsr.length > 10);
-                if (go && clicks < 4 && (n - lastClick) >= 8) {
+                if (go && window.__cnClicks < 4 && (n - lastClick) >= 8) {
                   lastClick = n;
-                  clicks++;
+                  window.__cnClicks++;
                   b.removeAttribute('hidden');
                   b.style.removeProperty('display');
                   ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(e){
                     b.dispatchEvent(new MouseEvent(e, {bubbles:true, cancelable:true, view:window}));
                   });
                   try { b.click(); } catch(e) {}
-                  beacon(true);
                 }
               }
             } catch(e) {}
-            if (n > 80) { clearInterval(t); beacon(true); }
+            if (n > 80) { clearInterval(t); }
           }, 750);
-          return 'armed';
+          return state();
         })();
     """.trimIndent()
 
@@ -336,11 +330,18 @@ class CimaNowProvider : MainAPI() {
             // Resolve the ad-redirect chain (302 / href.li / meta / js) without the WebView.
             val start = resolveInterstitial(rawStart, ::d)
 
+            // State strings reported by the injected script on each reinjection.
+            val states = java.util.concurrent.CopyOnWriteArrayList<String>()
             val resolver = WebViewResolver(
                 interceptUrl = Regex("""cimanow\.[a-z.]+/.+/watching/"""),
-                additionalUrls = listOf(Regex("""diag\.invalid""")),
                 script = armScript,
-                scriptCallback = { },
+                scriptCallback = { raw ->
+                    val s = raw.removeSurrounding("\"").take(300)
+                    if (s.isNotBlank() && s != "null" && states.lastOrNull() != s) {
+                        states.add(s)
+                        android.util.Log.w("CimaNowDiag", "CimaNow v6 state: " + s)
+                    }
+                },
                 timeout = 70_000L
             )
             val res = runCatching {
@@ -352,10 +353,7 @@ class CimaNowProvider : MainAPI() {
             if (pair == null) {
                 d("S2 WebView threw " + (res.exceptionOrNull()?.javaClass?.simpleName ?: "?"))
             } else {
-                val beacons = pair.second.mapNotNull {
-                    runCatching { java.net.URLDecoder.decode(it.url.toString().substringAfter("/s?"), "UTF-8") }.getOrNull()
-                }
-                d("S2 beacons=" + beacons.size + " last=[" + (beacons.lastOrNull() ?: "none") + "]")
+                d("S2 states=" + states.size + " last=[" + (states.lastOrNull() ?: "none") + "]")
                 val req = pair.first
                 if (req == null) {
                     d("S3 no /watching/ request within 70s")
