@@ -303,18 +303,14 @@ class CimaNowProvider : MainAPI() {
             d("ERR " + e.javaClass.simpleName)
         }
         if (!found) {
-            // Clearly labeled diagnostic entry, not a stream. Shows which stage stopped.
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = "DIAG v3 " + diag.toString().take(300),
-                    url = "https://diag.invalid/none",
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = ""
-                    this.quality = Qualities.Unknown.value
+            // Supported diagnostic surfaces only: app logcat (Settings > Show logcat, tag CimaNowDiag) and a toast.
+            val msg = "CimaNow v3 diag: " + diag.toString().take(400)
+            android.util.Log.w("CimaNowDiag", msg)
+            runCatching {
+                com.lagradost.cloudstream3.utils.Coroutines.main {
+                    com.lagradost.cloudstream3.CommonActivity.showToast(msg.take(220))
                 }
-            )
+            }
         }
         return found
     }
