@@ -189,58 +189,10 @@ class CimaNowProvider : MainAPI() {
         return m?.groupValues?.get(1) ?: url
     }
 
-    /**
-     * Follows the ad-interstitial hop chain (302s, href.li wrappers, meta refresh, JS
-     * location redirects) with plain requests so the WebView only has to drive the final
-     * page. Stops at large pages (the real interstitial is ~1 MB) and at challenge pages.
-     */
-    private suspend fun resolveInterstitial(start: String, d: (String) -> Unit): String {
-        var url = unwrapRedirector(start)
-        for (hop in 0..5) {
-            val resp = runCatching { app.get(url, allowRedirects = false) }.getOrNull()
-            if (resp == null) { d("H$hop fetch threw at " + hostOf(url)); return url }
-            val code = resp.code
-            val loc = resp.headers["Location"] ?: resp.headers["location"]
-            if (code in 300..399 && !loc.isNullOrBlank()) {
-                val next = unwrapRedirector(
-                    if (loc.startsWith("http")) loc else java.net.URI(url).resolve(loc).toString()
-                )
-                d("H$hop http$code -> " + hostOf(next))
-                if (next == url) return url
-                url = next
-                continue
-            }
-            val body = runCatching { resp.text }.getOrNull().orEmpty()
-            if (body.contains("Just a moment") || body.contains("Checking your browser")) {
-                d("H$hop challenge page at " + hostOf(url) + " code=$code")
-                return url
-            }
-            if (body.length in 1..19999) {
-                val meta = Regex(
-                    """http-equiv=["']?refresh["']?[^>]*url=(https?://[^"'>\s]+)""",
-                    RegexOption.IGNORE_CASE
-                ).find(body)?.groupValues?.get(1)
-                val js = Regex("""location\.(?:replace|assign)\(\s*["'](https?://[^"']+)["']""")
-                    .find(body)?.groupValues?.get(1)
-                    ?: Regex("""location\.href\s*=\s*["'](https?://[^"']+)["']""")
-                        .find(body)?.groupValues?.get(1)
-                val next = (meta ?: js)?.let { unwrapRedirector(it) }
-                if (next != null && next != url) {
-                    d("H$hop js/meta -> " + hostOf(next))
-                    url = next
-                    continue
-                }
-            }
-            d("H$hop stop host=" + hostOf(url) + " code=$code len=" + body.length)
-            return url
-        }
-        return url
-    }
-
-    // DIAGNOSTIC v6. The script is idempotent: WebViewResolver re-injects it on every
-    // intercepted request and calls scriptCallback with its return value, so each
-    // reinjection reports the current interstitial state. No diagnostic network requests
-    // at all (v5 beaconed to a fake domain, which both stormed and failed DNS).
+    // v7. Only observes and handles the href.li hop. Auto-clicking was removed: the site only
+    // accepts trusted (real touch) clicks on the interstitial button, which an injected script
+    // cannot produce. The resolver re-injects this on every intercepted request and passes the
+    // return value to scriptCallback, so each call reports the current page state.
     private val armScript = """
         (function(){
           function state(){
@@ -248,54 +200,22 @@ class CimaNowProvider : MainAPI() {
               var b = document.getElementById('downloadbtn');
               var vis = false, ready = 'x';
               if (b) {
-                try { vis = getComputedStyle(b).display !== 'none' && !b.hidden; } catch(e) {}
+                try { vis = getComputedStyle(b).display !== 'none'; } catch(e) {}
                 ready = b.getAttribute('data-link-ready') || 'x';
               }
-              var tsr = '';
-              try { tsr = (document.querySelector('[name=cf-turnstile-response]') || {}).value || ''; } catch(e) {}
               return 'host=' + location.host +
+                ';path=' + location.pathname.slice(0, 40) +
                 ';btn=' + (b ? (vis ? 'v' : 'h') : 'n') +
                 ';ready=' + ready +
-                ';tsr=' + tsr.length +
-                ';clk=' + (window.__cnClicks || 0) +
-                ';len=' + document.documentElement.innerHTML.length;
+                ';len=' + Math.round(document.documentElement.innerHTML.length / 20000);
             } catch(e) { return 'state-err'; }
           }
-          if (window.__cnArm) { return state(); }
-          window.__cnArm = 1;
-          window.__cnClicks = 0;
           try {
-            window.open = function(u){
-              try { if (u && /\/watching\//.test(String(u))) { window.location.href = u; } } catch(e) {}
-              return null;
-            };
+            if (/(^|\.)href\.li$/.test(location.host) && location.search.length > 8) {
+              var t = decodeURIComponent(location.search.substring(1));
+              if (/^https?:\/\//.test(t) && !window.__cnHop) { window.__cnHop = 1; location.replace(t); return 'hop ' + t.slice(0, 80); }
+            }
           } catch(e) {}
-          var n = 0, lastClick = -100;
-          var t = setInterval(function(){
-            n++;
-            try {
-              var b = document.getElementById('downloadbtn');
-              if (b) {
-                var vis = getComputedStyle(b).display !== 'none' && !b.hidden;
-                var ready = b.getAttribute('data-link-ready') === '1';
-                var realHref = b.href && String(b.href).indexOf('http') === 0;
-                var tsr = '';
-                try { tsr = (document.querySelector('[name=cf-turnstile-response]') || {}).value || ''; } catch(e) {}
-                var go = vis && (ready || realHref || tsr.length > 10);
-                if (go && window.__cnClicks < 4 && (n - lastClick) >= 8) {
-                  lastClick = n;
-                  window.__cnClicks++;
-                  b.removeAttribute('hidden');
-                  b.style.removeProperty('display');
-                  ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(e){
-                    b.dispatchEvent(new MouseEvent(e, {bubbles:true, cancelable:true, view:window}));
-                  });
-                  try { b.click(); } catch(e) {}
-                }
-              }
-            } catch(e) {}
-            if (n > 80) { clearInterval(t); }
-          }, 750);
           return state();
         })();
     """.trimIndent()
@@ -310,9 +230,9 @@ class CimaNowProvider : MainAPI() {
         fun d(s: String) {
             if (diag.isNotEmpty()) diag.append(" | ")
             diag.append(s)
-            android.util.Log.w("CimaNowDiag", "CimaNow v6 diag: " + s.take(350))
+            android.util.Log.w("CimaNowDiag", "CimaNow v7 diag: " + s.take(350))
         }
-        android.util.Log.w("CimaNowDiag", "CimaNow v6 diag: loadLinks start")
+        android.util.Log.w("CimaNowDiag", "CimaNow v7 diag: loadLinks start")
         var found = false
         try {
             val filmUrl = data.trimEnd('/')
@@ -327,8 +247,9 @@ class CimaNowProvider : MainAPI() {
                 ?.let { unb64(it) }?.takeIf { it.contains("/watching") }
             d("S1b watchGuess " + (if (watchGuess != null) "ok host=" + hostOf(watchGuess) else "none"))
 
-            // Resolve the ad-redirect chain (302 / href.li / meta / js) without the WebView.
-            val start = resolveInterstitial(rawStart, ::d)
+            // v7: no plain-request walk. A plain HTTP client is redirected to a decoy blog; only a real WebView gets the interstitial.
+            val start = rawStart
+            d("S1c webview start host=" + hostOf(start))
 
             // State strings reported by the injected script on each reinjection.
             val states = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -339,7 +260,7 @@ class CimaNowProvider : MainAPI() {
                     val s = raw.removeSurrounding("\"").take(300)
                     if (s.isNotBlank() && s != "null" && states.lastOrNull() != s) {
                         states.add(s)
-                        android.util.Log.w("CimaNowDiag", "CimaNow v6 state: " + s)
+                        android.util.Log.w("CimaNowDiag", "CimaNow v7 state: " + s)
                     }
                 },
                 timeout = 70_000L
@@ -393,7 +314,7 @@ class CimaNowProvider : MainAPI() {
                             val tr = runCatching { app.get(pageUrl, referer = watchUrl) }.getOrNull()
                             val text = tr?.text.orEmpty()
                             if (extOk == 0 && !found) d("S6 embed http=" + (tr?.code ?: -1) + " len=" + text.length)
-                            Regex("(?:file|src)\\s*[:=]\\s*[\"'](https?://[^\"']+\\.(?:mp4|m3u8)[^\"']*)")
+                            Regex("(?:file|src)\\s*[:=]\\s*[\"'](https?://[^\"']+\.(?:mp4|m3u8)[^\"']*)")
                                 .find(text)?.groupValues?.get(1)?.let { direct ->
                                     callback.invoke(
                                         newExtractorLink(
@@ -424,7 +345,7 @@ class CimaNowProvider : MainAPI() {
         }
         if (!found) {
             // Supported diagnostic surface: app logcat (Settings > Show logcat, tag CimaNowDiag).
-            val msg = "CimaNow v6 diag: " + diag.toString().take(400)
+            val msg = "CimaNow v7 diag: " + diag.toString().take(400)
             android.util.Log.w("CimaNowDiag", msg)
         }
         return found
