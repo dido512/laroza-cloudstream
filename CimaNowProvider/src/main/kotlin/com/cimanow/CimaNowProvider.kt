@@ -314,7 +314,7 @@ class CimaNowProvider : MainAPI() {
                             val tr = runCatching { app.get(pageUrl, referer = watchUrl) }.getOrNull()
                             val text = tr?.text.orEmpty()
                             if (extOk == 0 && !found) d("S6 embed http=" + (tr?.code ?: -1) + " len=" + text.length)
-                            Regex("(?:file|src)\\s*[:=]\\s*[\"'](https?://[^\"']+\.(?:mp4|m3u8)[^\"']*)")
+                            Regex("(?:file|src)\\s*[:=]\\s*[\"'](https?://[^\"']+\\.(?:mp4|m3u8)[^\"']*)")
                                 .find(text)?.groupValues?.get(1)?.let { direct ->
                                     callback.invoke(
                                         newExtractorLink(
