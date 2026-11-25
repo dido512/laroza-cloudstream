@@ -195,28 +195,64 @@ class CimaNowProvider : MainAPI() {
     // return value to scriptCallback, so each call reports the current page state.
     private val armScript = """
         (function(){
-          function state(){
-            try {
-              var b = document.getElementById('downloadbtn');
-              var vis = false, ready = 'x';
-              if (b) {
-                try { vis = getComputedStyle(b).display !== 'none'; } catch(e) {}
-                ready = b.getAttribute('data-link-ready') || 'x';
-              }
-              return 'host=' + location.host +
-                ';path=' + location.pathname.slice(0, 40) +
-                ';btn=' + (b ? (vis ? 'v' : 'h') : 'n') +
-                ';ready=' + ready +
-                ';len=' + Math.round(document.documentElement.innerHTML.length / 20000);
-            } catch(e) { return 'state-err'; }
-          }
+          var cap = 'cap=0';
+          try {
+            if (!window.__cnD) {
+              var D = window.__cnD = {pre: 0, ev: [], tok: 0};
+              try { D.pre = performance.getEntriesByType('resource').filter(function(e){ return /get-link\.php/.test(e.name); }).length; } catch(e) {}
+              var isHex = function(s){ return s.length === 64 && /^[0-9a-f]+/i.test(s) && !/[^0-9a-f]/i.test(s); };
+              var scan = function(o, dep){
+                if (dep > 4 || o == null) return false;
+                if (typeof o === 'string') return isHex(o) || /[?&]token=[0-9a-f]{64}/i.test(o);
+                if (typeof o === 'object') { for (var k in o) { if (scan(o[k], dep + 1)) return true; } }
+                return false;
+              };
+              var rec = function(kind, url, status, text){
+                url = String(url);
+                if (!/get-link\.php/.test(url)) return;
+                var a = (url.match(/action=(\w+)/) || [0, 'other'])[1];
+                var ok = false, tk = false, nk = -1;
+                try {
+                  var j = JSON.parse(text.replace(/^\uFEFF/, ''));
+                  ok = true; nk = (j && typeof j === 'object') ? Object.keys(j).length : 0; tk = scan(j, 0);
+                } catch(e) { tk = /[0-9a-f]{64}/i.test(text); }
+                if (tk) D.tok = 1;
+                D.ev.push(kind + ':' + a + ':st=' + status + ':json=' + (ok ? 1 : 0) + ':keys=' + nk + ':tokenlike=' + (tk ? 'y' : 'n') + ':len=' + Math.round(text.length / 50));
+              };
+              var ox = XMLHttpRequest.prototype.open, sx = XMLHttpRequest.prototype.send;
+              XMLHttpRequest.prototype.open = function(m, u){ this.__cu = u; return ox.apply(this, arguments); };
+              XMLHttpRequest.prototype.send = function(){
+                var s = this;
+                s.addEventListener('load', function(){ try { rec('x', s.__cu, s.status, String(s.responseText || '')); } catch(e) {} });
+                return sx.apply(this, arguments);
+              };
+              var of = window.fetch;
+              if (of) window.fetch = function(){
+                var a = arguments, u = String((a[0] && a[0].url) || a[0]);
+                var p = of.apply(this, a);
+                try { p.then(function(r){ try { r.clone().text().then(function(t){ rec('f', u, r.status, t); }); } catch(e) {} }); } catch(e) {}
+                return p;
+              };
+            }
+            var DD = window.__cnD;
+            cap = 'cap=1;pre=' + DD.pre + ';ev=[' + DD.ev.join(',') + '];tokenlike=' + (DD.tok ? 'y' : 'n');
+          } catch(e) { cap = 'cap-err'; }
           try {
             if (/(^|\.)href\.li$/.test(location.host) && location.search.length > 8) {
               var t = decodeURIComponent(location.search.substring(1));
               if (/^https?:\/\//.test(t) && !window.__cnHop) { window.__cnHop = 1; location.replace(t); return 'hop ' + t.slice(0, 80); }
             }
           } catch(e) {}
-          return state();
+          try {
+            var b = document.getElementById('downloadbtn');
+            var vis = false, ready = 'x';
+            if (b) {
+              try { vis = getComputedStyle(b).display !== 'none'; } catch(e) {}
+              ready = b.getAttribute('data-link-ready') || 'x';
+            }
+            return 'host=' + location.host + ';path=' + location.pathname.slice(0, 40) +
+              ';btn=' + (b ? (vis ? 'v' : 'h') : 'n') + ';ready=' + ready + ';' + cap;
+          } catch(e) { return 'state-err;' + cap; }
         })();
     """.trimIndent()
 
@@ -230,9 +266,9 @@ class CimaNowProvider : MainAPI() {
         fun d(s: String) {
             if (diag.isNotEmpty()) diag.append(" | ")
             diag.append(s)
-            android.util.Log.w("CimaNowDiag", "CimaNow v7 diag: " + s.take(350))
+            android.util.Log.w("CimaNowDiag", "CimaNow v8 diag: " + s.take(350))
         }
-        android.util.Log.w("CimaNowDiag", "CimaNow v7 diag: loadLinks start")
+        android.util.Log.w("CimaNowDiag", "CimaNow v8 diag: loadLinks start")
         var found = false
         try {
             val filmUrl = data.trimEnd('/')
@@ -257,10 +293,10 @@ class CimaNowProvider : MainAPI() {
                 interceptUrl = Regex("""cimanow\.[a-z.]+/.+/watching/"""),
                 script = armScript,
                 scriptCallback = { raw ->
-                    val s = raw.removeSurrounding("\"").take(300)
+                    val s = raw.removeSurrounding("\"").take(500)
                     if (s.isNotBlank() && s != "null" && states.lastOrNull() != s) {
                         states.add(s)
-                        android.util.Log.w("CimaNowDiag", "CimaNow v7 state: " + s)
+                        android.util.Log.w("CimaNowDiag", "CimaNow v8 state: " + s)
                     }
                 },
                 timeout = 70_000L
@@ -345,7 +381,7 @@ class CimaNowProvider : MainAPI() {
         }
         if (!found) {
             // Supported diagnostic surface: app logcat (Settings > Show logcat, tag CimaNowDiag).
-            val msg = "CimaNow v7 diag: " + diag.toString().take(400)
+            val msg = "CimaNow v8 diag: " + diag.toString().take(400)
             android.util.Log.w("CimaNowDiag", msg)
         }
         return found
